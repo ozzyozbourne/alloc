@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kohi · Linear allocator — C allocators in Rust</title>
+<style>
+:root { --fg:#1f2328; --muted:#59636e; --line:#d1d9e0; --bg:#ffffff; --soft:#f6f8fa;
+        --accent:#0969da; --c:#b35900; --rs:#a0410d; --good:#1a7f37; --bad:#cf222e; }
+* { box-sizing: border-box; }
+body { margin:0; font:16px/1.6 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--fg); background:var(--bg); }
+.layout { display:grid; grid-template-columns: 250px minmax(0,1fr); min-height:100vh; }
+nav { border-right:1px solid var(--line); background:var(--soft); padding:20px 16px; position:sticky; top:0; height:100vh; overflow:auto; font-size:14px; }
+nav a { display:block; color:var(--fg); text-decoration:none; padding:4px 8px; border-radius:6px; }
+nav a:hover { background:#eaeef2; }
+nav a.here { background:var(--accent); color:#fff; }
+nav h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:18px 8px 6px; }
+nav .toc a { color:var(--muted); padding-left:16px; }
+main { padding:32px 48px 80px; max-width:1180px; }
+h1 { font-size:32px; margin:0 0 4px; }
+h2 { font-size:24px; margin:48px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+h3 { font-size:18px; margin:28px 0 8px; }
+.lede { font-size:18px; color:var(--muted); margin:0 0 24px; }
+code { font:13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:var(--soft); padding:1px 5px; border-radius:4px; }
+pre { margin:0; padding:14px 16px; overflow:auto; background:#0d1117; color:#e6edf3; border-radius:0 0 8px 8px;
+      font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+pre code { background:none; padding:0; }
+figure.code { margin:14px 0; border:1px solid #30363d; border-radius:8px; }
+figure.code figcaption { font:12px ui-monospace, monospace; padding:6px 12px; background:#161b22; color:#9198a1; border-radius:8px 8px 0 0; display:flex; justify-content:space-between; gap:12px; }
+figure.code figcaption .lang { font-weight:700; }
+figure.code.c figcaption .lang { color:#f0883e; }
+figure.code.rs figcaption .lang { color:#ff7b72; }
+figure.code.out figcaption .lang { color:#7ee787; }
+figure.code figcaption a { color:#9198a1; }
+details.file { margin:12px 0; }
+details.file > summary { cursor:pointer; color:var(--accent); font-weight:600; }
+.pair { display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start; }
+.pair > div > h4 { margin:8px 0 0; font-size:13px; text-transform:uppercase; letter-spacing:.05em; }
+.pair > div > h4.c { color:var(--c); } .pair > div > h4.rs { color:var(--rs); }
+.note { border-left:4px solid var(--accent); background:#ddf4ff; padding:10px 14px; border-radius:0 6px 6px 0; margin:14px 0; }
+.warn { border-left:4px solid #bf8700; background:#fff8c5; padding:10px 14px; border-radius:0 6px 6px 0; margin:14px 0; }
+.bug  { border-left:4px solid var(--bad); background:#ffebe9; padding:10px 14px; border-radius:0 6px 6px 0; margin:14px 0; }
+table { border-collapse:collapse; width:100%; margin:14px 0; font-size:14.5px; }
+th, td { border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top; }
+th { background:var(--soft); }
+td.yes { color:var(--good); font-weight:600; } td.no { color:var(--bad); font-weight:600; }
+.diagram { background:var(--soft); border:1px solid var(--line); border-radius:8px; padding:14px; overflow:auto; }
+.diagram svg { display:block; margin:auto; max-width:100%; height:auto; }
+ol.steps > li { margin:10px 0; }
+@media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } nav { position:static; height:auto; } .pair { grid-template-columns: 1fr; } main { padding:20px; } }
+</style></head>
+<body><div class="layout">
+<nav><h2>Guides</h2><a href="../index.html" class="">Overview</a><a href="../01-kohi-linear-allocator/guide.html" class="here">Kohi · Linear allocator</a><a href="../02-kohi-pool-allocator/guide.html" class="">Kohi · Pool allocator</a><a href="../03-kohi-freelist/guide.html" class="">Kohi · Freelist</a><a href="../04-kohi-dynamic-allocator/guide.html" class="">Kohi · Dynamic allocator</a><a href="../05-rad-arena/guide.html" class="">RAD · Arena</a><a href="../06-rad-scratch-arenas/guide.html" class="">RAD · Scratch arenas</a><a href="../07-rad-thread-pool-arenas/guide.html" class="">RAD · Thread-pool arenas</a><h2>On this page</h2><div class="toc"><a href="#idea">1. The idea</a><a href="#c">2. The C version</a><a href="#rust">3. The Rust version</a><a href="#compare">4. Side by side</a><a href="#bug">5. The alignment problem in the C version</a><a href="#use">6. How to use it</a><a href="#build">7. Building it yourself, step by step</a><a href="#tests">8. Tests</a><a href="#files">9. Full source</a></div></nav>
+<main><h1>Kohi linear allocator in Rust</h1>
+<p class="lede">A bump allocator over one block of memory. The C version is about 60 lines. This page shows it, the Rust port built on <code>std::alloc::Allocator</code> (stable in Rust 1.100), and how the two compare.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>A linear allocator owns one block of memory and an offset into it. Allocating returns the address at the offset and moves the offset forward by the requested size. Single allocations are never freed. Instead, <code>free_all</code> moves the offset back to 0, which frees everything in one step.</p>
+<div class="diagram"><pre>
+ block (total_size bytes)
+ ┌──────────┬──────┬────────────────┬──────────────────────────────┐
+ │  alloc 1 │ pad  │    alloc 2     │            free              │
+ └──────────┴──────┴────────────────┴──────────────────────────────┘
+ ^ memory                           ^ memory + allocated             ^ memory + total_size
+
+ allocate(n):  p = memory + allocated;  allocated += n;  return p
+ free_all():   allocated = 0
+</pre></div>
+<p>This makes allocation a few instructions with no per-allocation bookkeeping. The cost is that you must know when <em>everything</em> in the block is finished, for example at the end of a frame. Kohi uses it for per-frame and startup data.</p>
+<p>The <code>pad</code> in the diagram only exists in the Rust version. The C version never pads, which is its main problem (see section 5).</p>
+
+<h2 id="c">2. The C version</h2>
+<p>The state is four fields. <code>owns_memory</code> records whether the allocator allocated the block itself or was handed one.</p>
+<figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.h">original-c/linear_allocator.h</a></span><span>lines 22–37</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic"> * @brief The data structure for a linear allocator.</span>
+<span style="color: #8B949E; font-style: italic"> */</span>
+<span style="color: #FF7B72">typedef</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #8B949E; font-style: italic">/** @brief The total size of memory in the allocator. */</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">total_size;</span>
+<span style="color: #6E7681">	</span><span style="color: #8B949E; font-style: italic">/** @brief The amount of memory currently allocated. */</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocated;</span>
+<span style="color: #6E7681">	</span><span style="color: #8B949E; font-style: italic">/** @brief The internal block of memory used by the allocator. */</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">memory;</span>
+<span style="color: #6E7681">	</span><span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic">	 * @brief Indicates if the allocator owns the memory (meaning it</span>
+<span style="color: #8B949E; font-style: italic">	 * performed the allocation itself) or whether it was provided by an outside source.</span>
+<span style="color: #8B949E; font-style: italic">	 */</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">b8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">owns_memory;</span>
+<span style="color: #E6EDF3">}</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">linear_allocator;</span>
+</code></pre></figure>
+<p>Creating it either uses a block you pass in or allocates one through <code>kallocate</code>, Kohi's engine-wide allocator (folder 04).</p>
+<figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.c">original-c/linear_allocator.c</a></span><span>lines 11–22</span></figcaption><pre><code><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">linear_allocator_create</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">total_size,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">memory,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">out_allocator)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(out_allocator)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">total_size;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">owns_memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">==</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(memory)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">memory;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">else</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">kallocate(total_size,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">MEMORY_TAG_LINEAR_ALLOCATOR);</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<p>Allocating checks for space, returns the current position and moves it forward. There is no <code>alignment</code> parameter.</p>
+<figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.c">original-c/linear_allocator.c</a></span><span>lines 35–50</span></figcaption><pre><code><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #D2A8FF; font-weight: bold">linear_allocator_allocate</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">remaining</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">-</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated;</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">KERROR(</span><span style="color: #A5D6FF">"linear_allocator_allocate - Tried to allocate %lluB, only %lluB remaining."</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">remaining);</span>
+<span style="color: #6E7681">			</span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">block</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">((u8</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">)allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size;</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">block;</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">KERROR(</span><span style="color: #A5D6FF">"linear_allocator_allocate - provided allocator not initialized."</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<p>Freeing everything resets the offset, and optionally zeroes the whole block.</p>
+<figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.c">original-c/linear_allocator.c</a></span><span>lines 52–59</span></figcaption><pre><code><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">linear_allocator_free_all</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">b8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">clear)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(clear)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">kzero_memory(allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size);</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.c">original-c/linear_allocator.c</a></span><span>lines 23–33</span></figcaption><pre><code><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">linear_allocator_destroy</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">owns_memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">kfree(allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory);</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">owns_memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">false;</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<p>Nothing in C stops you from calling <code>free_all</code> and then reading a pointer you got before it. The next allocation will overwrite that data.</p>
+
+<h2 id="rust">3. The Rust version</h2>
+<h3>The struct</h3>
+<p>Same fields, with two changes. <code>allocated</code> is a <code>Cell</code>, because <code>Allocator::allocate</code> takes <code>&amp;self</code>: many <code>Vec</code>s and <code>Box</code>es share one allocator through shared references, so the allocator has to change its own state through <code>&amp;self</code>. And a lifetime parameter <code>'buf</code> ties the allocator to a borrowed buffer, so the buffer cannot be freed while the allocator uses it.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 30–47</span></figcaption><pre><code><span style="color: #A5D6FF">/// A bump allocator over one fixed block of memory.</span>
+<span style="color: #A5D6FF">///</span>
+<span style="color: #A5D6FF">/// `'buf` is the lifetime of a caller-provided buffer (see [`LinearAllocator::from_buffer`]).</span>
+<span style="color: #A5D6FF">/// An allocator that owns its block is `LinearAllocator&lt;'static&gt;`.</span>
+<span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">LinearAllocator</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">buf</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Start of the block. C: `void *memory`.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">memory:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">NonNull</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `u64 total_size`.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">total_size:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Bytes used so far, including alignment padding. C: `u64 allocated`.</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// A `Cell`, because `Allocator::allocate` only gets `&amp;self`.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">allocated:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Cell</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">usize</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// `Some(layout)` if this allocator allocated `memory` itself and must free it.</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `b8 owns_memory`.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">owned:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Option</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Layout</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Ties a borrowed buffer's lifetime to the allocator.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">_buffer:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">PhantomData</span><span style="color: #FF7B72; font-weight: bold">&lt;&amp;'</span><span style="color: #E6EDF3">buf</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[MaybeUninit</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">]</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<h3>Creating it</h3>
+<p>C's single <code>create</code> with an optional <code>memory</code> pointer becomes two constructors. <code>new</code> owns its block; <code>from_buffer</code> borrows one, such as a stack array.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 49–66</span></figcaption><pre><code><span style="color: #FF7B72">impl</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">static</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Creates an allocator that owns a new `total_size`-byte block from the global</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// allocator. C: `linear_allocator_create(total_size, 0, &amp;alloc)`.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">new</span><span style="color: #E6EDF3">(total_size:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Self</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">layout</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Layout::from_size_align(total_size.max(</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">),</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">OWNED_BLOCK_ALIGN)</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.expect(</span><span style="color: #A5D6FF">"linear allocator size overflows isize"</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Global</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.allocate(layout)</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.unwrap_or_else(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">_</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">std::alloc::handle_alloc_error(layout));</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">memory:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">memory</span><span style="color: #E6EDF3">.cast(),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">total_size,</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">allocated:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Cell</span><span style="color: #E6EDF3">::new(</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">owned:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Some(layout),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">_buffer:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">PhantomData</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 69–79</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Creates an allocator over a buffer the caller owns, such as a stack array or</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// part of a larger block. C: `linear_allocator_create(size, memory, &amp;alloc)`.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">from_buffer</span><span style="color: #E6EDF3">(buffer:</span><span style="color: #6E7681"> </span><span style="color: #79C0FF">&amp;</span><span style="color: #FF7B72; font-weight: bold">'</span><span style="color: #E6EDF3">buf</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[MaybeUninit</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">])</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Self</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">total_size:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">buffer</span><span style="color: #E6EDF3">.len(),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">memory:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">NonNull</span><span style="color: #E6EDF3">::from(buffer).cast(),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">allocated:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Cell</span><span style="color: #E6EDF3">::new(</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">owned:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">None,</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">_buffer:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">PhantomData</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<h3>Implementing <code>Allocator</code></h3>
+<p>This is the whole allocator. Only two methods are required; <code>grow</code>, <code>shrink</code> and <code>allocate_zeroed</code> have default implementations built on these two.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 111–138</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">// SAFETY:</span>
+<span style="color: #8B949E; font-style: italic">// - Each returned block lies inside `memory[..total_size]` and starts at or after</span>
+<span style="color: #8B949E; font-style: italic">//   the end of the previous one, so blocks never overlap.</span>
+<span style="color: #8B949E; font-style: italic">// - Blocks stay valid until `free_all` (needs `&amp;mut self`) or `Drop` runs, which</span>
+<span style="color: #8B949E; font-style: italic">//   are the two ways the `Allocator` contract allows memory to be invalidated.</span>
+<span style="color: #8B949E; font-style: italic">// - Nothing here panics.</span>
+<span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">impl</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">_</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">allocate</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">self,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">layout:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Layout</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Result</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">NonNull</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">[</span><span style="color: #FF7B72">u8</span><span style="color: #E6EDF3">]</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">AllocError</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// Align the *address*, not just the offset, so any buffer alignment works.</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">base</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.memory.addr().get();</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">start</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(base</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.allocated.get())</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.checked_next_multiple_of(layout.align())</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.ok_or(AllocError)</span><span style="color: #FF7B72; font-weight: bold">?</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72; font-weight: bold">-</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">base;</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">end</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">start</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.checked_add(layout.size())</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.filter(</span><span style="color: #FF7B72; font-weight: bold">|&amp;</span><span style="color: #E6EDF3">end</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">end</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.total_size)</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.ok_or(AllocError)</span><span style="color: #FF7B72; font-weight: bold">?</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">self.allocated.set(end);</span>
+<span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// SAFETY: `start &lt;= end &lt;= total_size`, so the pointer stays inside the block.</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.memory.add(start)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">Ok(NonNull::slice_from_raw_parts(ptr,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">layout.size()))</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">deallocate</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">self,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">_ptr:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">NonNull</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">_layout:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Layout</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// Single allocations are not freed; `free_all` frees everything at once.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<p>Three things to notice:</p>
+<ul>
+<li><b>Alignment.</b> The start is rounded up to <code>layout.align()</code>. It rounds the <em>address</em>, not the offset, so it is right even when the buffer itself is misaligned.</li>
+<li><b>Overflow.</b> <code>checked_next_multiple_of</code> and <code>checked_add</code> return <code>None</code> on overflow, which becomes <code>AllocError</code>. The C version computes <code>allocated + size</code> without checking.</li>
+<li><b>Return type.</b> <code>NonNull&lt;[u8]&gt;</code> is a pointer plus a length. The length tells the caller how many bytes it actually got, which can be more than it asked for (the pool in folder 02 uses this).</li>
+</ul>
+<h3>Resetting it</h3>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 96–108</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Resets the allocator to empty, optionally zeroing the block.</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `linear_allocator_free_all(&amp;alloc, clear)`.</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">///</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Taking `&amp;mut self` is what makes this safe: nothing allocated from `self`</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// can still be alive when this runs.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">free_all</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">clear:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">bool</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">self.allocated.set(</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">clear</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #8B949E; font-style: italic">// SAFETY: `memory` is valid for writes of `total_size` bytes, and no</span>
+<span style="color: #6E7681">            </span><span style="color: #8B949E; font-style: italic">// allocation from it is alive because we hold `&amp;mut self`.</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.memory.write_bytes(</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.total_size)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<p>The important part is <code>&amp;mut self</code>. Every <code>Vec&lt;T, &amp;LinearAllocator&gt;</code> holds a shared borrow of the allocator, and the compiler will not let you take <code>&amp;mut</code> while any shared borrow is alive. So you cannot reset the block while anything still points into it:</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> does not compile (doc test in src/lib.rs)</span></figcaption><pre><code>let mut frame = LinearAllocator::new(1024);
+let v: Vec&lt;u32, &amp;LinearAllocator&gt; = Vec::with_capacity_in(4, &amp;frame);
+frame.free_all(false); // error[E0502]: cannot borrow `frame` as mutable
+                       // because it is also borrowed as immutable
+drop(v);</code></pre></figure>
+<h3>Destroying it</h3>
+<p>C's <code>linear_allocator_destroy</code> becomes <code>Drop</code>, so it runs automatically and only once.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 140–148</span></figcaption><pre><code><span style="color: #FF7B72">impl</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Drop</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">_</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `linear_allocator_destroy`. Frees the block only if this allocator owns it.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">drop</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Some(layout)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.owned</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #8B949E; font-style: italic">// SAFETY: `memory` was allocated from `Global` with exactly `layout`.</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Global.deallocate(self.memory,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">layout)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+
+<h2 id="compare">4. Side by side</h2>
+<table>
+<tr><th></th><th>C (Kohi)</th><th>Rust port</th></tr>
+<tr><td>Allocate</td><td><code>linear_allocator_allocate(&amp;a, size)</code> returns <code>void*</code></td><td><code>Box::new_in(x, &amp;a)</code>, <code>Vec::new_in(&amp;a)</code>, or <code>a.allocate(layout)</code></td></tr>
+<tr><td>Alignment</td><td class="no">None</td><td class="yes">Always, from the type's <code>Layout</code></td></tr>
+<tr><td>Out of space</td><td>Logs an error, returns 0</td><td>Returns <code>AllocError</code>; <code>Vec::try_reserve</code> reports it, <code>Vec::push</code> aborts</td></tr>
+<tr><td>Size overflow</td><td>Unchecked</td><td>Checked</td></tr>
+<tr><td>Use after <code>free_all</code></td><td class="no">Allowed, silently reads overwritten data</td><td class="yes">Compile error</td></tr>
+<tr><td>Destroy</td><td>Manual <code>linear_allocator_destroy</code></td><td><code>Drop</code></td></tr>
+<tr><td>Borrowed buffer</td><td>Pointer; nothing checks it outlives the allocator</td><td><code>from_buffer(&amp;mut [MaybeUninit&lt;u8&gt;])</code>, checked by <code>'buf</code></td></tr>
+<tr><td>Freeing one value</td><td>Not possible</td><td><code>deallocate</code> is a no-op; dropping a <code>Box</code> runs its destructor but keeps the memory</td></tr>
+</table>
+
+<h2 id="bug">5. The alignment problem in the C version</h2>
+<div class="bug"><b>C:</b> allocations are packed back to back. Allocate 1 byte, then a <code>u64</code>, and the <code>u64</code> lands at an odd address. On x86 that is only slower; on some ARM targets, and for SIMD types, it faults or is undefined behaviour.</div>
+<p>The Rust test <code>aligns_each_allocation_unlike_the_c_version</code> checks the fix: a <code>u8</code> followed by a <code>u64</code> uses 16 bytes (1 + 7 padding + 8), and the <code>u64</code> address is a multiple of 8.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="tests/linear.rs">tests/linear.rs</a></span><span>lines 8–17</span></figcaption><pre><code><span style="color: #8B949E; font-weight: bold; font-style: italic">#[test]</span>
+<span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">aligns_each_allocation_unlike_the_c_version</span><span style="color: #E6EDF3">()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">a</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LinearAllocator::new(</span><span style="color: #A5D6FF">256</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">byte</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Box::new_in(</span><span style="color: #A5D6FF">7</span><span style="color: #FF7B72">u8</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">a);</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">word</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Box::new_in(</span><span style="color: #A5D6FF">9</span><span style="color: #FF7B72">u64</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">a);</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// 1 byte, 7 bytes of padding, then 8 bytes for the u64.</span>
+<span style="color: #6E7681">    </span><span style="color: #D2A8FF; font-weight: bold">assert_eq!</span><span style="color: #E6EDF3">((</span><span style="color: #FF7B72; font-weight: bold">&amp;*</span><span style="color: #E6EDF3">word</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">as</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">u64</span><span style="color: #E6EDF3">).addr()</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">%</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">8</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">    </span><span style="color: #D2A8FF; font-weight: bold">assert_eq!</span><span style="color: #E6EDF3">(a.allocated(),</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">16</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">    </span><span style="color: #D2A8FF; font-weight: bold">assert_eq!</span><span style="color: #E6EDF3">((</span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">byte,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">word),</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(</span><span style="color: #A5D6FF">7</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">9</span><span style="color: #E6EDF3">));</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+
+<h2 id="use">6. How to use it</h2>
+<p>Pass <code>&amp;allocator</code> as the last argument of any <code>*_in</code> constructor. <code>&amp;A</code> is itself an <code>Allocator</code> when <code>A</code> is, so many containers can share one allocator.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> per-frame allocation</span></figcaption><pre><code>let mut frame = LinearAllocator::new(64 * 1024);
+loop {
+    {
+        let mut commands: Vec&lt;DrawCommand, &amp;LinearAllocator&gt; = Vec::with_capacity_in(8, &amp;frame);
+        commands.push(...);
+        let label = Box::new_in(*b"frame", &amp;frame);
+        // ... render ...
+    } // commands and label are dropped here
+    frame.free_all(false); // allowed: nothing borrows `frame` any more
+}</code></pre></figure>
+<div class="warn"><b>Watch out for growing <code>Vec</code>s.</b> When a <code>Vec</code> outgrows its capacity, the default <code>grow</code> allocates a new buffer and copies; the old buffer is not reclaimed until <code>free_all</code>. Reserve the capacity you need up front. The RAD arena (folder 05) overrides <code>grow</code> to extend the last allocation in place.</div>
+<p>The full example, <code>examples/demo.rs</code>, runs three frames and then reuses the allocator over a stack buffer:</p>
+<figure class="code out"><figcaption><span><span class="lang">Output</span> cargo run -p kohi_linear --example demo</span></figcaption><pre><code>frame 0: 8 commands, label "frame", used 560 of 65536 bytes
+  u8 at 0x…, next u64 at 0x… (aligned to 8: true)
+  after free_all: used 0 bytes
+frame 1: 8 commands, label "frame", used 560 of 65536 bytes
+  u8 at 0x…, next u64 at 0x… (aligned to 8: true)
+  after free_all: used 0 bytes
+frame 2: 8 commands, label "frame", used 560 of 65536 bytes
+  u8 at 0x…, next u64 at 0x… (aligned to 8: true)
+  after free_all: used 0 bytes
+stack buffer: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100], used 20 of 256 bytes
+</code></pre></figure>
+<p>The same addresses repeat every frame because <code>free_all</code> hands the same memory out again.</p>
+
+<h2 id="build">7. Building it yourself, step by step</h2>
+<ol class="steps">
+<li><b>Pick the state.</b> A pointer to the block, its size, and a <code>Cell&lt;usize&gt;</code> offset. Use <code>Cell</code> because <code>allocate</code> only gets <code>&amp;self</code>.</li>
+<li><b>Get a block.</b> <code>Global.allocate(Layout::from_size_align(size, 16)?)</code>, and remember the layout so <code>Drop</code> can free it with exactly the same one.</li>
+<li><b>Write <code>allocate</code>.</b> Round the current address up to <code>layout.align()</code>, add <code>layout.size()</code>, check against the end, store the new offset, return <code>NonNull::slice_from_raw_parts(ptr, size)</code>. Use checked arithmetic and return <code>Err(AllocError)</code> on any failure. Never panic: the trait requires that allocator methods do not unwind.</li>
+<li><b>Write <code>deallocate</code></b> as an empty function.</li>
+<li><b>Write the <code>unsafe impl</code></b> with a <code>// SAFETY:</code> comment that explains why blocks never overlap and stay valid until they are invalidated. Implementing <code>Allocator</code> is <code>unsafe</code> because collections trust these promises.</li>
+<li><b>Make reset take <code>&amp;mut self</code>.</b> This is what turns use-after-reset into a compile error.</li>
+<li><b>Test it</b> with values of different alignments, exhaustion, and reuse after reset. Run the tests under Miri (<code>cargo +nightly miri test</code>) to catch undefined behaviour in the unsafe code.</li>
+</ol>
+
+<h2 id="tests">8. Tests</h2>
+<p><code>tests/linear.rs</code> checks alignment (including inside a deliberately misaligned buffer), exhaustion, <code>free_all</code> reusing and clearing the block, and that <code>deallocate</code> keeps memory. All pass on Rust 1.100 beta and under Miri with <code>-Zmiri-strict-provenance</code>.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="tests/linear.rs">tests/linear.rs</a></span><span>lines 19–31</span></figcaption><pre><code><span style="color: #8B949E; font-weight: bold; font-style: italic">#[test]</span>
+<span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">aligns_addresses_even_when_the_buffer_is_misaligned</span><span style="color: #E6EDF3">()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">storage</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[MaybeUninit::</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u64</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">::uninit();</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">8</span><span style="color: #E6EDF3">];</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// Start the buffer one byte past an 8-byte boundary.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">bytes:</span><span style="color: #6E7681"> </span><span style="color: #79C0FF">&amp;</span><span style="color: #F0883E; font-weight: bold">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[MaybeUninit</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">MaybeUninit</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;&gt;</span><span style="color: #E6EDF3">().add(</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">),</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">63</span><span style="color: #E6EDF3">)</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">};</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">a</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LinearAllocator::from_buffer(bytes);</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">word</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">a.allocate(Layout::new::</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u64</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">()).unwrap();</span>
+<span style="color: #6E7681">    </span><span style="color: #D2A8FF; font-weight: bold">assert_eq!</span><span style="color: #E6EDF3">(word.cast::</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">().addr().get()</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">%</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">8</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// 7 bytes of padding to reach the boundary, then 8 bytes.</span>
+<span style="color: #6E7681">    </span><span style="color: #D2A8FF; font-weight: bold">assert_eq!</span><span style="color: #E6EDF3">(a.allocated(),</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">15</span><span style="color: #E6EDF3">);</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+
+<h2 id="files">9. Full source</h2>
+<details class="file"><summary>Show the whole file: src/lib.rs (149 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–149</span></figcaption><pre><code><span style="color: #A5D6FF">//! A port of Kohi's `linear_allocator` (`kohi.core/src/memory/allocators/linear_allocator.c`).</span>
+<span style="color: #A5D6FF">//!</span>
+<span style="color: #A5D6FF">//! A linear allocator hands out memory from one block by moving an offset forward.</span>
+<span style="color: #A5D6FF">//! Single allocations are never freed; [`LinearAllocator::free_all`] resets the</span>
+<span style="color: #A5D6FF">//! whole block at once.</span>
+<span style="color: #A5D6FF">//!</span>
+<span style="color: #A5D6FF">//! Differences from the C version:</span>
+<span style="color: #A5D6FF">//! - Allocations are aligned to the `Layout` they ask for. The C version ignores</span>
+<span style="color: #A5D6FF">//!   alignment, so mixing sizes can return misaligned pointers.</span>
+<span style="color: #A5D6FF">//! - `free_all` takes `&amp;mut self`, so the compiler rejects any call while a `Vec`</span>
+<span style="color: #A5D6FF">//!   or `Box` still points into the block:</span>
+<span style="color: #A5D6FF">//!</span>
+<span style="color: #A5D6FF">//! ```compile_fail,E0502</span>
+<span style="color: #A5D6FF">//! use kohi_linear::LinearAllocator;</span>
+<span style="color: #A5D6FF">//! let mut frame = LinearAllocator::new(1024);</span>
+<span style="color: #A5D6FF">//! let v: Vec&lt;u32, &amp;LinearAllocator&gt; = Vec::with_capacity_in(4, &amp;frame);</span>
+<span style="color: #A5D6FF">//! frame.free_all(false); // error: `frame` is still borrowed by `v`</span>
+<span style="color: #A5D6FF">//! drop(v);</span>
+<span style="color: #A5D6FF">//! ```</span>
+
+<span style="color: #FF7B72">use</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">std::alloc::{AllocError,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Allocator,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Global,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Layout};</span>
+<span style="color: #FF7B72">use</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">std::cell::Cell;</span>
+<span style="color: #FF7B72">use</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">std::marker::PhantomData;</span>
+<span style="color: #FF7B72">use</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">std::mem::MaybeUninit;</span>
+<span style="color: #FF7B72">use</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">std::ptr::NonNull;</span>
+
+<span style="color: #A5D6FF">/// Alignment of the block the allocator allocates for itself in [`LinearAllocator::new`].</span>
+<span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">OWNED_BLOCK_ALIGN:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">16</span><span style="color: #E6EDF3">;</span>
+
+<span style="color: #A5D6FF">/// A bump allocator over one fixed block of memory.</span>
+<span style="color: #A5D6FF">///</span>
+<span style="color: #A5D6FF">/// `'buf` is the lifetime of a caller-provided buffer (see [`LinearAllocator::from_buffer`]).</span>
+<span style="color: #A5D6FF">/// An allocator that owns its block is `LinearAllocator&lt;'static&gt;`.</span>
+<span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">LinearAllocator</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">buf</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Start of the block. C: `void *memory`.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">memory:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">NonNull</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `u64 total_size`.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">total_size:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Bytes used so far, including alignment padding. C: `u64 allocated`.</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// A `Cell`, because `Allocator::allocate` only gets `&amp;self`.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">allocated:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Cell</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">usize</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// `Some(layout)` if this allocator allocated `memory` itself and must free it.</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `b8 owns_memory`.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">owned:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Option</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Layout</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Ties a borrowed buffer's lifetime to the allocator.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">_buffer:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">PhantomData</span><span style="color: #FF7B72; font-weight: bold">&lt;&amp;'</span><span style="color: #E6EDF3">buf</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[MaybeUninit</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">]</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #FF7B72">impl</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">static</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Creates an allocator that owns a new `total_size`-byte block from the global</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// allocator. C: `linear_allocator_create(total_size, 0, &amp;alloc)`.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">new</span><span style="color: #E6EDF3">(total_size:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Self</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">layout</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Layout::from_size_align(total_size.max(</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">),</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">OWNED_BLOCK_ALIGN)</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.expect(</span><span style="color: #A5D6FF">"linear allocator size overflows isize"</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Global</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.allocate(layout)</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.unwrap_or_else(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">_</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">std::alloc::handle_alloc_error(layout));</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">memory:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">memory</span><span style="color: #E6EDF3">.cast(),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">total_size,</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">allocated:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Cell</span><span style="color: #E6EDF3">::new(</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">owned:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Some(layout),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">_buffer:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">PhantomData</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #FF7B72">impl</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">buf</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">buf</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Creates an allocator over a buffer the caller owns, such as a stack array or</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// part of a larger block. C: `linear_allocator_create(size, memory, &amp;alloc)`.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">from_buffer</span><span style="color: #E6EDF3">(buffer:</span><span style="color: #6E7681"> </span><span style="color: #79C0FF">&amp;</span><span style="color: #FF7B72; font-weight: bold">'</span><span style="color: #E6EDF3">buf</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[MaybeUninit</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">])</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Self</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">total_size:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">buffer</span><span style="color: #E6EDF3">.len(),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">memory:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">NonNull</span><span style="color: #E6EDF3">::from(buffer).cast(),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">allocated:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Cell</span><span style="color: #E6EDF3">::new(</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">),</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">owned:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">None,</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">_buffer:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">PhantomData</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Total size of the block in bytes.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">total_size</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">self)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">self.total_size</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Bytes used so far, including alignment padding.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">allocated</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">self)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">self.allocated.get()</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Bytes left before the allocator is full.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">remaining</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">self)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">self.total_size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">-</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.allocated.get()</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Resets the allocator to empty, optionally zeroing the block.</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `linear_allocator_free_all(&amp;alloc, clear)`.</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">///</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Taking `&amp;mut self` is what makes this safe: nothing allocated from `self`</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// can still be alive when this runs.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">free_all</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">clear:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">bool</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">self.allocated.set(</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">clear</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #8B949E; font-style: italic">// SAFETY: `memory` is valid for writes of `total_size` bytes, and no</span>
+<span style="color: #6E7681">            </span><span style="color: #8B949E; font-style: italic">// allocation from it is alive because we hold `&amp;mut self`.</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.memory.write_bytes(</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.total_size)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #8B949E; font-style: italic">// SAFETY:</span>
+<span style="color: #8B949E; font-style: italic">// - Each returned block lies inside `memory[..total_size]` and starts at or after</span>
+<span style="color: #8B949E; font-style: italic">//   the end of the previous one, so blocks never overlap.</span>
+<span style="color: #8B949E; font-style: italic">// - Blocks stay valid until `free_all` (needs `&amp;mut self`) or `Drop` runs, which</span>
+<span style="color: #8B949E; font-style: italic">//   are the two ways the `Allocator` contract allows memory to be invalidated.</span>
+<span style="color: #8B949E; font-style: italic">// - Nothing here panics.</span>
+<span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">impl</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">_</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">allocate</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">self,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">layout:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Layout</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Result</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">NonNull</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">[</span><span style="color: #FF7B72">u8</span><span style="color: #E6EDF3">]</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">AllocError</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// Align the *address*, not just the offset, so any buffer alignment works.</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">base</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.memory.addr().get();</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">start</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(base</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.allocated.get())</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.checked_next_multiple_of(layout.align())</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.ok_or(AllocError)</span><span style="color: #FF7B72; font-weight: bold">?</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72; font-weight: bold">-</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">base;</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">end</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">start</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.checked_add(layout.size())</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.filter(</span><span style="color: #FF7B72; font-weight: bold">|&amp;</span><span style="color: #E6EDF3">end</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">end</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.total_size)</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">.ok_or(AllocError)</span><span style="color: #FF7B72; font-weight: bold">?</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">self.allocated.set(end);</span>
+<span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// SAFETY: `start &lt;= end &lt;= total_size`, so the pointer stays inside the block.</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.memory.add(start)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">Ok(NonNull::slice_from_raw_parts(ptr,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">layout.size()))</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">deallocate</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">self,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">_ptr:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">NonNull</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">_layout:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Layout</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// Single allocations are not freed; `free_all` frees everything at once.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #FF7B72">impl</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Drop</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LinearAllocator</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">_</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `linear_allocator_destroy`. Frees the block only if this allocator owns it.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">drop</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Some(layout)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.owned</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #8B949E; font-style: italic">// SAFETY: `memory` was allocated from `Global` with exactly `layout`.</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Global.deallocate(self.memory,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">layout)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure></details>
+<details class="file"><summary>Show the whole file: original-c/linear_allocator.h (73 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.h">original-c/linear_allocator.h</a></span><span>lines 1–73</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic"> * @file linear_allocator.h</span>
+<span style="color: #8B949E; font-style: italic"> * @author Travis Vroman (travis@kohiengine.com)</span>
+<span style="color: #8B949E; font-style: italic"> * @brief This file contains the linear allocator implementation.</span>
+<span style="color: #8B949E; font-style: italic"> * @details A linear allocator allocates memory from its internal block of memory</span>
+<span style="color: #8B949E; font-style: italic"> * in a linear fashion. That is, one after another, moving a pointer along as it goes.</span>
+<span style="color: #8B949E; font-style: italic"> * A linear allocator can perform allocations of any size, but allocation sizes are</span>
+<span style="color: #8B949E; font-style: italic"> * not stored, and thus allocations made in this way are not individually freeable.</span>
+<span style="color: #8B949E; font-style: italic"> * Only the entire thing can be freed. This comes with the benefit of speed at a cost</span>
+<span style="color: #8B949E; font-style: italic"> * of flexibility.</span>
+<span style="color: #8B949E; font-style: italic"> * @version 1.0</span>
+<span style="color: #8B949E; font-style: italic"> * @date 2022-01-10</span>
+<span style="color: #8B949E; font-style: italic"> *</span>
+<span style="color: #8B949E; font-style: italic"> * @copyright Kohi Game Engine is Copyright (c) Travis Vroman 2021-2026</span>
+<span style="color: #8B949E; font-style: italic"> *</span>
+<span style="color: #8B949E; font-style: italic"> */</span>
+
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#pragma once</span>
+
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#include</span><span style="color: #6E7681"> </span><span style="color: #8B949E; font-style: italic">"defines.h"</span>
+
+<span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic"> * @brief The data structure for a linear allocator.</span>
+<span style="color: #8B949E; font-style: italic"> */</span>
+<span style="color: #FF7B72">typedef</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #8B949E; font-style: italic">/** @brief The total size of memory in the allocator. */</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">total_size;</span>
+<span style="color: #6E7681">	</span><span style="color: #8B949E; font-style: italic">/** @brief The amount of memory currently allocated. */</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocated;</span>
+<span style="color: #6E7681">	</span><span style="color: #8B949E; font-style: italic">/** @brief The internal block of memory used by the allocator. */</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">memory;</span>
+<span style="color: #6E7681">	</span><span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic">	 * @brief Indicates if the allocator owns the memory (meaning it</span>
+<span style="color: #8B949E; font-style: italic">	 * performed the allocation itself) or whether it was provided by an outside source.</span>
+<span style="color: #8B949E; font-style: italic">	 */</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">b8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">owns_memory;</span>
+<span style="color: #E6EDF3">}</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">linear_allocator;</span>
+
+<span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic"> * @brief Creates a linear allocator of the given size.</span>
+<span style="color: #8B949E; font-style: italic"> *</span>
+<span style="color: #8B949E; font-style: italic"> * @param total_size The total amount in bytes the allocator will hold.</span>
+<span style="color: #8B949E; font-style: italic"> * @param memory Allocated block of memory matching size above, or 0. If 0, a dynamic allocation is performed</span>
+<span style="color: #8B949E; font-style: italic"> * and this allocator is considered to own that memory.</span>
+<span style="color: #8B949E; font-style: italic"> * @param out_allocator A pointer to hold the new allocator.</span>
+<span style="color: #8B949E; font-style: italic"> */</span>
+<span style="color: #E6EDF3">KAPI</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">linear_allocator_create</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">total_size,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">memory,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">out_allocator);</span>
+
+<span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic"> * @brief Destroys the given allocator. If the allocator owns its memory, it is freed at this time.</span>
+<span style="color: #8B949E; font-style: italic"> *</span>
+<span style="color: #8B949E; font-style: italic"> * @param allocator A pointer to the allocator to be destroyed.</span>
+<span style="color: #8B949E; font-style: italic"> */</span>
+<span style="color: #E6EDF3">KAPI</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">linear_allocator_destroy</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator);</span>
+
+<span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic"> * @brief Allocates the given amount from the allocator.</span>
+<span style="color: #8B949E; font-style: italic"> *</span>
+<span style="color: #8B949E; font-style: italic"> * @param allocator A pointer to the allocator to allocate from.</span>
+<span style="color: #8B949E; font-style: italic"> * @param size The size to be allocated.</span>
+<span style="color: #8B949E; font-style: italic"> * @return A pointer to a block of memory as allocated. If this fails, 0 is returned.</span>
+<span style="color: #8B949E; font-style: italic"> */</span>
+<span style="color: #E6EDF3">KAPI</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">linear_allocator_allocate</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size);</span>
+
+<span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic"> * @brief Frees everything in the allocator, effectively moving its pointer back to the beginning.</span>
+<span style="color: #8B949E; font-style: italic"> * Does not free internal memory, if owned. Only resets the pointer.</span>
+<span style="color: #8B949E; font-style: italic"> *</span>
+<span style="color: #8B949E; font-style: italic"> * @param allocator A pointer to the allocator to free.</span>
+<span style="color: #8B949E; font-style: italic"> * @param clear Indicates whether or not to clear/zero the memory. Enabling this obviously takes more processing power.</span>
+<span style="color: #8B949E; font-style: italic"> */</span>
+<span style="color: #E6EDF3">KAPI</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">linear_allocator_free_all</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">b8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">clear);</span>
+</code></pre></figure></details>
+<details class="file"><summary>Show the whole file: original-c/linear_allocator.c (60 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.c">original-c/linear_allocator.c</a></span><span>lines 1–60</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
+<span style="color: #8B949E; font-style: italic"> * @file linear_allocator.c</span>
+<span style="color: #8B949E; font-style: italic"> * @copyright Kohi Game Engine is Copyright (c) Travis Vroman 2021-2026</span>
+<span style="color: #8B949E; font-style: italic"> */</span>
+
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#include</span><span style="color: #6E7681"> </span><span style="color: #8B949E; font-style: italic">"linear_allocator.h"</span>
+
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#include</span><span style="color: #6E7681"> </span><span style="color: #8B949E; font-style: italic">"logger.h"</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#include</span><span style="color: #6E7681"> </span><span style="color: #8B949E; font-style: italic">"memory/kmemory.h"</span>
+
+<span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">linear_allocator_create</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">total_size,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">memory,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">out_allocator)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(out_allocator)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">total_size;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">owns_memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">==</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(memory)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">memory;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">else</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">out_allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">kallocate(total_size,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">MEMORY_TAG_LINEAR_ALLOCATOR);</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+<span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">linear_allocator_destroy</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">owns_memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">kfree(allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory);</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">owns_memory</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">false;</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #D2A8FF; font-weight: bold">linear_allocator_allocate</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">u64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">remaining</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">-</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated;</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">KERROR(</span><span style="color: #A5D6FF">"linear_allocator_allocate - Tried to allocate %lluB, only %lluB remaining."</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">remaining);</span>
+<span style="color: #6E7681">			</span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">block</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">((u8</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">)allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated;</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size;</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">block;</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">}</span>
+
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">KERROR(</span><span style="color: #A5D6FF">"linear_allocator_allocate - provided allocator not initialized."</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">linear_allocator_free_all</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">b8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">clear)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">	</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">allocated</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">		</span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(clear)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">			</span><span style="color: #E6EDF3">kzero_memory(allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">memory,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">allocator</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">total_size);</span>
+<span style="color: #6E7681">		</span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">	</span><span style="color: #E6EDF3">}</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure></details>
+</main>
+</div></body></html>

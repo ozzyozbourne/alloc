@@ -1,0 +1,13 @@
+[package]
+name = "kohi_dynamic"
+version = "0.1.0"
+description = "Kohi's general-purpose dynamic allocator (freelist heap with tags and guards), ported to Rust"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+kohi_freelist.workspace = true
+
+[lints]
+workspace = true

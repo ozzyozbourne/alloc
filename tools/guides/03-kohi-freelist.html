@@ -1,0 +1,94 @@
+<h1>Kohi freelist in Rust</h1>
+<p class="lede">The freelist is the engine inside Kohi's dynamic allocator. It tracks which byte ranges of a region are free, and never touches the region itself. This page ports it and explains why, in Rust, it is deliberately <em>not</em> an <code>Allocator</code>.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>A freelist answers two questions about a region of <code>total_size</code> bytes: "give me <i>n</i> free bytes" and "these <i>n</i> bytes at offset <i>o</i> are free again". It answers with <em>offsets</em>, not pointers. That is why Kohi can use the same code for its CPU heap (folder 04) and for sub-allocating Vulkan buffers, whose memory the CPU cannot dereference.</p>
+<div class="diagram"><pre>
+ region:   0          100      150               300                           1000
+           ├── used ───┼─ free ─┼────── used ──────┼─────────── free ─────────────┤
+
+ free list (sorted by offset):   (100, 50) → (300, 700)
+
+ allocate_block(30):    first fit → front of (100, 50) → returns 100;   list: (130, 20) → (300, 700)
+ free_block(150, 150):  touches 130+20 = 150 on the left and 300 on the right → merges:   (130, 870)
+</pre></div>
+<p>Three rules make it work:</p>
+<ul>
+<li><b>Sorted by offset</b>, so neighbours are adjacent in the list.</li>
+<li><b>First fit</b>: allocation takes the front of the first range that is big enough.</li>
+<li><b>Coalescing</b>: a freed range merges with the free range before it, after it, or both, so the list never holds two touching ranges.</li>
+</ul>
+<p>The list nodes come from a fixed array, so the freelist itself never allocates. You ask how much memory it needs, provide that memory, and it lives there. This is what lets the dynamic allocator run as the program's global allocator.</p>
+
+<h2 id="c">2. The C version</h2>
+{{c-item original-c/freelist.c typedef struct freelist_node {}}
+{{c-item original-c/freelist.c typedef struct internal_state {}}
+<p>Creating it uses Kohi's two-call pattern: call once with <code>memory = 0</code> to learn how many bytes the node array needs, then again with a block of that size.</p>
+{{c-item original-c/freelist.c void freelist_create (}}
+<p>Allocation walks the list and either removes an exact fit or shrinks a larger range from the front.</p>
+{{c-item original-c/freelist.c b8 freelist_allocate_block (}}
+<p>Freeing is the long part, with cases for an empty list, appending to the left neighbour, inserting before a node and merging both ways, and appending at the end.</p>
+{{c-item original-c/freelist.c b8 freelist_free_block (}}
+<p>Unused nodes are found by a linear scan for <code>size == 0</code>:</p>
+{{c-item original-c/freelist.c static freelist_node *get_node (freelist *list) {}}
+
+<h2 id="bugs">3. Problems in the C version</h2>
+<div class="bug"><b>Out of nodes.</b> <code>get_node</code> returns 0 when every node is used, and every caller writes <code>new_node-&gt;offset</code> straight away. Heavy fragmentation therefore crashes. The node count is <code>total_size / (sizeof(void*) * sizeof(freelist_node))</code>, at least 20: 21 nodes for a 4 KiB region.</div>
+<div class="warn"><b>Partial double frees.</b> Only an exact repeat (<code>node-&gt;offset == offset</code>) is detected. Freeing a range that overlaps a free range at a different offset, or freeing with the wrong size, silently corrupts the list.</div>
+<div class="warn"><b>No range check.</b> Freeing beyond <code>total_size</code> is accepted.</div>
+
+<h2 id="rust">4. The Rust version</h2>
+<h3>Nodes and storage</h3>
+<p>Nodes link by <code>u32</code> index instead of pointer, and an unused node has <code>size == 0</code>, as in C. The storage is a type parameter <code>S</code>: a <code>Box&lt;[Node]&gt;</code> by default, or any <code>&amp;mut [Node]</code>. That replaces C's two-call pattern with something the type system checks, and folder 04 uses it to keep the nodes inside the heap's own block.</p>
+{{rs-item src/lib.rs pub struct Node}}
+{{rs-item src/lib.rs pub fn node_count_for}}
+{{rs-item src/lib.rs pub struct FreeList<S}}
+<h3>Allocating</h3>
+<p>A line-for-line match of the C first-fit loop.</p>
+{{rs-item src/lib.rs pub fn allocate_block}}
+<h3>Freeing</h3>
+<p>The C version handles each list shape separately. The Rust version finds the two neighbours once (<code>prev</code>, the last free range starting before <code>offset</code>, and <code>cur</code>, the first one after), rejects any overlap with either, and then a single <code>match</code> on "touches prev?" and "touches next?" covers all four cases. Every error is checked before anything is changed, so a rejected free leaves the list intact.</p>
+{{rs-item src/lib.rs pub fn free_block}}
+{{rs-item src/lib.rs pub enum FreeError}}
+<h3>Resizing</h3>
+<p>C's <code>freelist_resize</code> hands the old block back through an out-parameter for the caller to free. In Rust, <code>resize</code> consumes the list and returns the old storage, so the caller can decide what to do with it and cannot keep using the old list.</p>
+{{rs-item src/lib.rs pub fn resize}}
+
+<h2 id="why">5. Why it is not an <code>Allocator</code></h2>
+<p><code>Allocator::allocate</code> must return a pointer to memory that the allocator guarantees is valid. A freelist only knows numbers; the region might be GPU memory, a file, or not exist yet. Making it an <code>Allocator</code> would force it to own a CPU block, which would remove the GPU use case. So it stays a plain data structure, and folder 04 wraps it, together with a block of memory, into an <code>Allocator</code>. This split (bookkeeping vs memory) is a useful pattern for any allocator.</p>
+
+<h2 id="compare">6. Side by side</h2>
+<table>
+<tr><th></th><th>C (Kohi)</th><th>Rust port</th></tr>
+<tr><td>Links</td><td>Pointers</td><td><code>u32</code> indices</td></tr>
+<tr><td>Node storage</td><td>Caller-provided block, sized by a first call</td><td><code>S: AsMut&lt;[Node]&gt;</code>; <code>Box</code> or borrowed slice</td></tr>
+<tr><td>Allocate</td><td>First fit</td><td>First fit (same results)</td></tr>
+<tr><td>Free: merge</td><td>Both neighbours</td><td>Both neighbours</td></tr>
+<tr><td>Out of nodes</td><td class="no">Null dereference</td><td class="yes"><code>Err(OutOfNodes)</code></td></tr>
+<tr><td>Double / overlapping free</td><td>Exact repeat only</td><td class="yes">Any overlap: <code>Err(AlreadyFree)</code></td></tr>
+<tr><td>Out-of-range free</td><td class="no">Accepted</td><td class="yes"><code>Err(OutOfRange)</code></td></tr>
+<tr><td>Errors</td><td><code>b8</code> plus log message</td><td><code>Result&lt;(), FreeError&gt;</code></td></tr>
+</table>
+
+<h2 id="use">7. How to use it</h2>
+<p>The demo sub-allocates a pretend 4 KiB GPU vertex buffer:</p>
+{{output kohi_freelist demo}}
+{{rs-item examples/demo.rs fn main}}
+
+<h2 id="build">8. Building it yourself, step by step</h2>
+<ol class="steps">
+<li><b>Decide on offsets or pointers.</b> Offsets keep the structure reusable for memory you cannot touch.</li>
+<li><b>Pick a node store.</b> A fixed array with a "free" marker (this port), a separate free stack of node indices (faster than a scan), or nodes stored inside the free memory itself (no extra memory, but only for CPU memory).</li>
+<li><b>Allocate:</b> walk the sorted list, take the first range big enough, remove it on an exact fit, otherwise shrink it.</li>
+<li><b>Free:</b> find the neighbours, validate, then merge left, right, both, or insert.</li>
+<li><b>Test against a simple model.</b> A byte map that marks each byte used or free is slow but obviously correct. Run thousands of random operations and compare after each one.</li>
+</ol>
+
+<h2 id="tests">9. Tests</h2>
+<p>The model test runs 5,000 random allocations and frees on a 4 KiB region and, after every step, checks that the free ranges are exactly the free bytes of a byte map, sorted, disjoint and fully merged. It also checks that a failed allocation really had no fitting range.</p>
+{{rs-item tests/freelist.rs fn matches_a_byte_map_under_random_operations}}
+
+<h2 id="files">10. Full source</h2>
+{{rs-file src/lib.rs}}
+{{c-file original-c/freelist.h}}
+{{c-file original-c/freelist.c}}

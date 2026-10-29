@@ -1,0 +1,96 @@
+<h1>Kohi pool allocator in Rust</h1>
+<p class="lede">A pool splits one block into equal-sized slots and hands them out one at a time. Kohi added this allocator on 2026-10-28 and it is not finished yet; the Rust port fills in what is missing and shows the Rust type system catching two of its bugs.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>When you allocate and free many objects of the same size, such as particles, entities or network packets, a general-purpose heap wastes time searching and fragments memory. A pool avoids both: every slot is the same size, so any free slot fits any request, and the free slots are kept in a list.</p>
+<div class="diagram"><pre>
+ slots:  ┌────────┬────────┬────────┬────────┬────────┐
+         │ slot 0 │ slot 1 │ slot 2 │ slot 3 │ slot 4 │     element_size bytes each
+         │  used  │  free  │  used  │  free  │  free  │
+         └────────┴────────┴────────┴────────┴────────┘
+ free list (sorted by address):  head → 1 → 3 → 4 → end
+
+ allocate():  take head (slot 1),        head = 3              O(1)
+ free(2):     walk to the right place,   1 → 2 → 3 → 4         O(free slots)
+</pre></div>
+<p>Kohi keeps the free list <em>sorted by address</em>, so allocation always returns the lowest free slot. That keeps live objects packed toward the start of the block, which is friendlier to the cache, at the cost of an O(n) free. The Rust port keeps the same policy so the two behave the same.</p>
+
+<h2 id="c">2. The C version</h2>
+<p>The free list nodes live in a separate array, one node per slot. Each node stores its slot's byte offset and a <code>next</code> pointer.</p>
+{{c-item original-c/pool_allocator.h typedef struct pool_allocator_free_node {}}
+{{c-item original-c/pool_allocator.h typedef struct pool_allocator {}}
+<p>Creating the pool allocates the slots and the node array, then links every node to the next.</p>
+{{c-item original-c/pool_allocator.c pool_allocator pool_allocator_create (}}
+<p>Allocating pops the head and returns the slot's index as well as its address.</p>
+{{c-item original-c/pool_allocator.c void *pool_allocator_allocate (}}
+<p>Freeing finds the node for the slot and inserts it in offset order.</p>
+{{c-item original-c/pool_allocator.c void pool_allocator_free (}}
+<p>And destroying it does nothing:</p>
+{{c-item original-c/pool_allocator.c void pool_allocator_destroy (}}
+
+<h2 id="bugs">3. Problems in the C version</h2>
+<div class="bug"><b>Leak.</b> <code>pool_allocator_destroy</code> is empty, so the slot block and the node array are never freed.</div>
+<div class="bug"><b>Full pool.</b> When every slot is taken, <code>head</code> is null. <code>KASSERT_DEBUG(head)</code> catches that in debug builds; in release builds the next line reads <code>head-&gt;offset</code> through a null pointer.</div>
+<div class="bug"><b>Double free makes a cycle.</b> If a slot is freed twice, the search loop stops <em>at</em> that slot's node (its offset is not less than itself), then sets <code>freed-&gt;next = *cur</code>, which is <code>freed</code>. The node now points to itself, and <code>pool_allocator_elements_free</code> loops forever.</div>
+<div class="warn"><b>Alignment is left to the caller.</b> The block comes from <code>kallocate</code> without an alignment, and slots are <code>element_size</code> apart. Whether each slot is aligned for the element type depends on the size you pass and on the allocator underneath.</div>
+
+<h2 id="rust">4. The Rust version</h2>
+<h3>The struct</h3>
+<p>Instead of an array of nodes holding pointers to each other, the Rust version keeps an array of indices: <code>next[i]</code> is the free slot after slot <code>i</code>. Indices avoid self-referential pointers, which matters in Rust because the struct is moved when it is returned from <code>new</code>. (C has the same move, but its nodes point into a separate heap array, so it gets away with it.) Each index is a <code>Cell</code> because <code>allocate</code> only gets <code>&amp;self</code>.</p>
+{{rs-item src/lib.rs pub struct PoolAllocator}}
+<h3>Creating it</h3>
+<p>It takes a <code>Layout</code> rather than a byte size, so slots are sized and aligned for the element type. <code>pad_to_align</code> rounds the slot size up so that every slot, not just the first, is aligned.</p>
+{{rs-item src/lib.rs pub fn new(slot: Layout}}
+<h3>Taking a slot</h3>
+<p>The same O(1) pop. A full pool returns <code>None</code> instead of dereferencing null.</p>
+{{rs-item src/lib.rs pub fn allocate_slot}}
+<h3>Implementing <code>Allocator</code></h3>
+<p><code>allocate</code> refuses layouts that do not fit a slot, then pops a slot. It reports the <em>whole slot</em> as the block's size, which the trait allows: a <code>Vec</code> could use the extra bytes as capacity.</p>
+<p><code>deallocate</code> is the sorted insert from C. Because it walks the list with indices, it can see when the slot is already in the list and abort, instead of making a cycle. It aborts rather than panics because allocator methods must not unwind.</p>
+{{rs-item src/lib.rs unsafe impl Allocator for PoolAllocator}}
+<h3>Destroying it</h3>
+{{rs-item src/lib.rs impl Drop for PoolAllocator}}
+<p>The compiler also guarantees the order. A <code>Box&lt;T, &amp;PoolAllocator&gt;</code> borrows the pool, so the pool cannot be dropped while any box is alive.</p>
+<h3>Trying to allocate</h3>
+<p><code>Box::try_new_in</code>, which would return an error instead of aborting when the pool is full, is still unstable (it is part of the <code>allocator_ext</code> feature). <code>try_box</code> does the same with stable APIs: it calls <code>allocate</code>, writes the value, and wraps the slot with <code>Box::from_raw_in</code>.</p>
+{{rs-item src/lib.rs pub fn try_box}}
+
+<h2 id="compare">5. Side by side</h2>
+<table>
+<tr><th></th><th>C (Kohi)</th><th>Rust port</th></tr>
+<tr><td>Free list storage</td><td>Array of nodes with <code>offset</code> and <code>next</code> pointer</td><td>Array of <code>Cell&lt;usize&gt;</code> next-indices</td></tr>
+<tr><td>Allocate</td><td>O(1), returns pointer and index</td><td>O(1); <code>allocate_slot</code> returns both, <code>Allocator::allocate</code> returns the pointer</td></tr>
+<tr><td>Free</td><td>O(n) sorted insert</td><td>Same</td></tr>
+<tr><td>Count free slots</td><td>Walks the list, O(n)</td><td>Stored counter, O(1)</td></tr>
+<tr><td>Pool full</td><td class="no">Null dereference in release</td><td class="yes"><code>None</code> / <code>AllocError</code></td></tr>
+<tr><td>Double free</td><td class="no">Self-loop, later infinite loop</td><td class="yes">Detected, aborts</td></tr>
+<tr><td>Foreign pointer</td><td>Debug assertion only</td><td>Checked always, aborts</td></tr>
+<tr><td>Slot alignment</td><td>Up to the caller</td><td>From the element's <code>Layout</code></td></tr>
+<tr><td>Destroy</td><td class="no">Empty, leaks</td><td class="yes"><code>Drop</code> frees everything</td></tr>
+<tr><td>Destroy while in use</td><td>Allowed</td><td>Compile error</td></tr>
+</table>
+
+<h2 id="use">6. How to use it</h2>
+{{output kohi_pool demo}}
+<p>The demo spawns six particles into four slots; two are refused. Killing particles 1 and 3 frees slots 1 and 3, and the next two spawns reuse them lowest first, because the free list is sorted.</p>
+{{rs-item examples/demo.rs fn main}}
+<div class="note">Use <code>Box&lt;T, &amp;PoolAllocator&gt;</code> for single objects. A <code>Vec</code> in a pool only works while its whole buffer fits in one slot, which is rarely what you want.</div>
+
+<h2 id="build">7. Building it yourself, step by step</h2>
+<ol class="steps">
+<li><b>Size the slot</b> with <code>Layout::pad_to_align()</code> so consecutive slots stay aligned, and allocate <code>slot.size() * capacity</code> bytes with the slot's alignment.</li>
+<li><b>Build the free list.</b> Either store a next-index per slot in a side array (this port, and Kohi), or store the next pointer <em>inside</em> each free slot (an intrusive list, which needs no extra memory but requires slots at least pointer-sized).</li>
+<li><b>Write <code>allocate</code>:</b> reject layouts larger or more aligned than a slot, pop the head, return the slot.</li>
+<li><b>Write <code>deallocate</code>:</b> compute the index from the pointer, verify it is a slot boundary, and push it back. LIFO push is O(1); a sorted insert, as here, keeps allocations low.</li>
+<li><b>Free the block in <code>Drop</code></b> with the same layout you allocated it with.</li>
+<li><b>Test</b> order of reuse, exhaustion, alignment of an over-aligned type such as <code>#[repr(align(64))]</code>, and rejection of interior or foreign pointers.</li>
+</ol>
+
+<h2 id="tests">8. Tests</h2>
+<p>The key test frees slot 0 and then slot 2, and checks that slot 0 is handed out first. A LIFO free list, the usual simpler choice, would return slot 2 and fail it.</p>
+{{rs-item tests/pool.rs fn free_list_stays_sorted_so_the_lowest_slot_is_reused_first}}
+
+<h2 id="files">9. Full source</h2>
+{{rs-file src/lib.rs}}
+{{c-file original-c/pool_allocator.h}}
+{{c-file original-c/pool_allocator.c}}

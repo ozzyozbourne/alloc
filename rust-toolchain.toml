@@ -1,0 +1,5 @@
+# The allocator API is stable in Rust 1.100. Until 1.100.0 ships on the stable
+# channel (expected 2026-11-12), use beta. Afterwards, change this to "stable".
+[toolchain]
+channel = "beta"
+components = ["clippy", "rustfmt"]

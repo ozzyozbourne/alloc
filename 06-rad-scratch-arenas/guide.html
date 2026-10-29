@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAD · Scratch arenas — C allocators in Rust</title>
+<style>
+:root { --fg:#1f2328; --muted:#59636e; --line:#d1d9e0; --bg:#ffffff; --soft:#f6f8fa;
+        --accent:#0969da; --c:#b35900; --rs:#a0410d; --good:#1a7f37; --bad:#cf222e; }
+* { box-sizing: border-box; }
+body { margin:0; font:16px/1.6 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--fg); background:var(--bg); }
+.layout { display:grid; grid-template-columns: 250px minmax(0,1fr); min-height:100vh; }
+nav { border-right:1px solid var(--line); background:var(--soft); padding:20px 16px; position:sticky; top:0; height:100vh; overflow:auto; font-size:14px; }
+nav a { display:block; color:var(--fg); text-decoration:none; padding:4px 8px; border-radius:6px; }
+nav a:hover { background:#eaeef2; }
+nav a.here { background:var(--accent); color:#fff; }
+nav h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:18px 8px 6px; }
+nav .toc a { color:var(--muted); padding-left:16px; }
+main { padding:32px 48px 80px; max-width:1180px; }
+h1 { font-size:32px; margin:0 0 4px; }
+h2 { font-size:24px; margin:48px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+h3 { font-size:18px; margin:28px 0 8px; }
+.lede { font-size:18px; color:var(--muted); margin:0 0 24px; }
+code { font:13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:var(--soft); padding:1px 5px; border-radius:4px; }
+pre { margin:0; padding:14px 16px; overflow:auto; background:#0d1117; color:#e6edf3; border-radius:0 0 8px 8px;
+      font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+pre code { background:none; padding:0; }
+figure.code { margin:14px 0; border:1px solid #30363d; border-radius:8px; }
+figure.code figcaption { font:12px ui-monospace, monospace; padding:6px 12px; background:#161b22; color:#9198a1; border-radius:8px 8px 0 0; display:flex; justify-content:space-between; gap:12px; }
+figure.code figcaption .lang { font-weight:700; }
+figure.code.c figcaption .lang { color:#f0883e; }
+figure.code.rs figcaption .lang { color:#ff7b72; }
+figure.code.out figcaption .lang { color:#7ee787; }
+figure.code figcaption a { color:#9198a1; }
+details.file { margin:12px 0; }
+details.file > summary { cursor:pointer; color:var(--accent); font-weight:600; }
+.pair { display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start; }
+.pair > div > h4 { margin:8px 0 0; font-size:13px; text-transform:uppercase; letter-spacing:.05em; }
+.pair > div > h4.c { color:var(--c); } .pair > div > h4.rs { color:var(--rs); }
+.note { border-left:4px solid var(--accent); background:#ddf4ff; padding:10px 14px; border-radius:0 6px 6px 0; margin:14px 0; }
+.warn { border-left:4px solid #bf8700; background:#fff8c5; padding:10px 14px; border-radius:0 6px 6px 0; margin:14px 0; }
+.bug  { border-left:4px solid var(--bad); background:#ffebe9; padding:10px 14px; border-radius:0 6px 6px 0; margin:14px 0; }
+table { border-collapse:collapse; width:100%; margin:14px 0; font-size:14.5px; }
+th, td { border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top; }
+th { background:var(--soft); }
+td.yes { color:var(--good); font-weight:600; } td.no { color:var(--bad); font-weight:600; }
+.diagram { background:var(--soft); border:1px solid var(--line); border-radius:8px; padding:14px; overflow:auto; }
+.diagram svg { display:block; margin:auto; max-width:100%; height:auto; }
+ol.steps > li { margin:10px 0; }
+@media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } nav { position:static; height:auto; } .pair { grid-template-columns: 1fr; } main { padding:20px; } }
+</style></head>
+<body><div class="layout">
+<nav><h2>Guides</h2><a href="../index.html" class="">Overview</a><a href="../01-kohi-linear-allocator/guide.html" class="">Kohi · Linear allocator</a><a href="../02-kohi-pool-allocator/guide.html" class="">Kohi · Pool allocator</a><a href="../03-kohi-freelist/guide.html" class="">Kohi · Freelist</a><a href="../04-kohi-dynamic-allocator/guide.html" class="">Kohi · Dynamic allocator</a><a href="../05-rad-arena/guide.html" class="">RAD · Arena</a><a href="../06-rad-scratch-arenas/guide.html" class="here">RAD · Scratch arenas</a><a href="../07-rad-thread-pool-arenas/guide.html" class="">RAD · Thread-pool arenas</a><h2>On this page</h2><div class="toc"><a href="#idea">1. The idea</a><a href="#c">2. The C version</a><a href="#rust">3. The Rust version</a><a href="#compare">4. Side by side</a><a href="#use">5. How to use it</a><a href="#build">6. Building it yourself, step by step</a><a href="#tests">7. Tests</a><a href="#files">8. Full source</a></div></nav>
+<main><h1>RAD Debugger scratch arenas in Rust</h1>
+<p class="lede">Per-thread arenas for temporary work, borrowed and popped back around a function body. In C the caller must list the arenas the callee may not use; in Rust the borrow checker makes that list unnecessary.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>Most functions need temporary memory: a list being built, a string being formatted, a lookup table. In RAD, functions take an output arena for their <em>result</em> and get temporary memory from a thread-local <em>scratch</em> arena, which they pop back before returning:</p>
+<figure class="code c"><figcaption><span><span class="lang">C</span> the RAD pattern</span></figcaption><pre><code>String8 join_paths(Arena *out, String8List parts)
+{
+  Temp scratch = scratch_begin(&amp;out, 1);   // a scratch arena that is not `out`
+  ... temporary work on scratch.arena ...
+  String8 result = push_str8_copy(out, ...);
+  scratch_end(scratch);                     // pop everything temporary
+  return result;
+}</code></pre></figure>
+<p>The <code>&amp;out, 1</code> argument is the <b>conflicts</b> list. Suppose the caller itself used a scratch arena as <code>out</code>. If <code>join_paths</code> picked that same arena as its scratch, then <code>scratch_end</code> would pop it back to where it was <em>before the result was pushed</em>, and the returned string would point at freed memory. So each thread has two scratch arenas, and the callee picks one that is not in the conflicts list.</p>
+<div class="diagram"><pre>
+ caller:     Temp a = scratch_begin(0, 0);          → scratch arena 0
+             join_paths(a.arena, parts);
+ callee:       scratch_begin(&amp;out = arena 0, 1);    → arena 0 is a conflict → scratch arena 1
+               result pushed to arena 0 (out)
+               scratch_end → pops arena 1 only       ✓ result survives
+</pre></div>
+<p>The scheme is fast and simple, but correctness depends on every function passing the right conflicts. Forget one and you get a use-after-free that only shows up when the arenas happen to collide.</p>
+
+<h2 id="c">2. The C version</h2>
+<p>Each thread's context holds two arenas, created when the thread starts. The context struct itself is pushed onto the first one.</p>
+<figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.h">original-c/base_thread_context.h</a></span><span>lines 55–80</span></figcaption><pre><code><span style="color: #FF7B72">typedef</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">TCTX</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX;</span>
+<span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">TCTX</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: scratch arenas</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arenas[</span><span style="color: #A5D6FF">2</span><span style="color: #E6EDF3">];</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: thread name</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">thread_name[</span><span style="color: #A5D6FF">32</span><span style="color: #E6EDF3">];</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">thread_name_size;</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: lane context</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">LaneCtx</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">lane_ctx;</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: source location info</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">char</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">file_name;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">line_number;</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: accesses</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">access_arena;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">free_access;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">free_touch;</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: progress</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">progress_counter_ptr;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">progress_target_ptr;</span>
+<span style="color: #E6EDF3">};</span>
+</code></pre></figure>
+<figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.c">original-c/base_thread_context.c</a></span><span>lines 14–32</span></figcaption><pre><code><span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span>
+<span style="color: #E6EDF3">tctx_alloc(</span><span style="color: #FF7B72">void</span><span style="color: #E6EDF3">)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#if PROFILE_TELEMETRY</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">thread_static</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">static</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">char</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">name[</span><span style="color: #A5D6FF">2</span><span style="color: #E6EDF3">][</span><span style="color: #A5D6FF">1024</span><span style="color: #E6EDF3">];</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">raddbg_snprintf(name[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">],</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">sizeof</span><span style="color: #E6EDF3">(name[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">]),</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"Scratch/0[TID:%u]"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tid());</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">raddbg_snprintf(name[</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">],</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">sizeof</span><span style="color: #E6EDF3">(name[</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">]),</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"Scratch/1[TID:%u]"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tid());</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_0</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_alloc(.name</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">name[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">]);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_1</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_alloc(.name</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">name[</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">]);</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#else</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_0</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_alloc();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_1</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_alloc();</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#endif</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">push_array(arena_0,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_0;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas[</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_1;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">lane_ctx.lane_count</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx;</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<p>Picking a scratch arena is a search for the first one that is not in <code>conflicts</code>. Note that it returns 0 if both are conflicts.</p>
+<figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.c">original-c/base_thread_context.c</a></span><span>lines 55–80</span></figcaption><pre><code><span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span>
+<span style="color: #E6EDF3">tctx_get_scratch(Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">**</span><span style="color: #E6EDF3">conflicts,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">count)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_selected();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">result</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">**</span><span style="color: #E6EDF3">arena_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas;</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">for</span><span style="color: #E6EDF3">(U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">ArrayCount(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas);</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">)</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">**</span><span style="color: #E6EDF3">conflict_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">conflicts;</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">B32</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">has_conflict</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">for</span><span style="color: #E6EDF3">(U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">j</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">j</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">count;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">j</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">conflict_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">)</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">      </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">==</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">conflict_ptr)</span>
+<span style="color: #6E7681">      </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">has_conflict</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">break</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">      </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">!</span><span style="color: #E6EDF3">has_conflict)</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">      </span><span style="color: #E6EDF3">result</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_ptr;</span>
+<span style="color: #6E7681">      </span><span style="color: #FF7B72">break</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">result;</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<p><code>scratch_begin</code> and <code>scratch_end</code> are just <code>temp_begin</code>/<code>temp_end</code> (folder 05) on that arena:</p>
+<figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.h">original-c/base_thread_context.h</a></span><span>lines 98–99</span></figcaption><pre><code><span style="color: #8B949E; font-weight: bold; font-style: italic">#define scratch_begin(conflicts, count) temp_begin(tctx_get_scratch((conflicts), (count)))</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define scratch_end(scratch) temp_end(scratch)</span>
+</code></pre></figure>
+
+<h2 id="rust">3. The Rust version</h2>
+<p>The thread-local storage holds a growable list of arenas, each in a <code>RefCell</code>. A <code>RefCell</code> tracks at run time whether it is borrowed, and that is the key: an arena that is lent out to any enclosing scope is <em>borrowed</em>, so it is automatically a conflict.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 35–40</span></figcaption><pre><code><span style="color: #D2A8FF; font-weight: bold">thread_local!</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `TCTX::arenas[2]`. Boxed so each arena keeps its address while the</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// `Vec` grows: `with_scratch` keeps a pointer to the arena while it runs.</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-weight: bold; font-style: italic">#[allow(clippy::vec_box)]</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">static</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">SCRATCH:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">RefCell</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Vec</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Box</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">RefCell</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Arena</span><span style="color: #FF7B72; font-weight: bold">&gt;&gt;&gt;&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">RefCell::new(Vec::new())</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<p><code>with_scratch</code> picks the first arena that can be borrowed mutably (i.e. no enclosing scope on this thread is using it), creates a new one if all are busy, starts a <code>Temp</code> on it, and runs your closure. When the closure returns, the <code>Temp</code> drops and pops the arena back, and the <code>RefCell</code> borrow ends.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 47–68</span></figcaption><pre><code><span style="color: #A5D6FF">/// Runs `f` with a scratch arena that no enclosing `with_scratch` on this</span>
+<span style="color: #A5D6FF">/// thread is using, then pops it back to where it was.</span>
+<span style="color: #A5D6FF">/// C: `scratch_begin(conflicts, count)` ... `scratch_end(scratch)`.</span>
+<span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">with_scratch</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">R</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">(f:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">impl</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">FnOnce(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">Arena)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">R</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">R</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cell:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">RefCell</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Arena</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">SCRATCH.with(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">s</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arenas</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">s.borrow_mut();</span>
+<span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// C: the loop in `tctx_get_scratch` that skips `conflicts`.</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">match</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arenas.iter().find(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">a</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">a.try_borrow_mut().is_ok())</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">Some(free)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;**</span><span style="color: #E6EDF3">free</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">as</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">_,</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">None</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">                </span><span style="color: #E6EDF3">arenas.push(Box::new(RefCell::new(Arena::new())));</span>
+<span style="color: #6E7681">                </span><span style="color: #FF7B72; font-weight: bold">&amp;**</span><span style="color: #E6EDF3">arenas.last().expect(</span><span style="color: #A5D6FF">"just pushed"</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">as</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">_</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">});</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// SAFETY: the boxes are never removed or moved, and thread-local storage</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// outlives any call running on its thread.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cell</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;*</span><span style="color: #E6EDF3">cell</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cell.borrow_mut();</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">temp</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena.temp();</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">f(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">temp)</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<h3>Why there is no conflicts list</h3>
+<p>The caller's output arena, if it is a scratch arena, is borrowed by the caller's own <code>with_scratch</code> call for as long as the caller runs. So when the callee asks for a scratch arena, that one is skipped by <code>try_borrow_mut</code>. There is nothing to pass and nothing to forget.</p>
+<h3>Scratch data cannot escape</h3>
+<p>The closure receives <code>&amp;Arena</code> with a lifetime that ends when <code>with_scratch</code> returns. The return type <code>R</code> is chosen outside the call, so it cannot mention that lifetime:</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> does not compile (doc test in src/lib.rs)</span></figcaption><pre><code>let leaked: &amp;str = rad_scratch::with_scratch(|s| s.push_str("temporary"));
+// error: lifetime may not live long enough</code></pre></figure>
+<p>In C, returning a <code>String8</code> that was pushed onto the scratch arena instead of <code>out</code> compiles and returns a dangling pointer.</p>
+
+<h2 id="compare">4. Side by side</h2>
+<table>
+<tr><th></th><th>C (RAD)</th><th>Rust port</th></tr>
+<tr><td>Arenas per thread</td><td>Exactly 2</td><td>Created on demand; as many as the deepest nesting</td></tr>
+<tr><td>Begin / end</td><td><code>scratch_begin(conflicts, n)</code> / <code>scratch_end(t)</code></td><td><code>with_scratch(|s| ...)</code></td></tr>
+<tr><td>Avoiding the output arena</td><td>Caller passes conflicts</td><td class="yes">Automatic: a borrowed arena is skipped</td></tr>
+<tr><td>Forgetting <code>scratch_end</code></td><td>Leaks until the arena is cleared</td><td class="yes">Impossible; the scope ends with the closure</td></tr>
+<tr><td>Returning scratch data</td><td class="no">Compiles, dangles</td><td class="yes">Compile error</td></tr>
+<tr><td>All arenas conflict</td><td>Returns 0</td><td>Makes a new arena</td></tr>
+<tr><td>Reusing a non-conflicting outer scratch</td><td>Yes: a callee may share the caller's scratch arena if it is not the output</td><td>No: each nesting level gets its own arena</td></tr>
+</table>
+<div class="note">That last row is the real cost. RAD's two arenas suffice for any depth because the same arena is reused at alternating levels, safely, as long as each level pops only what it pushed. The Rust version cannot prove that alternation is safe, so it takes one arena per open scope. Since arenas only reserve address space and commit on demand, the extra arenas are cheap.</div>
+
+<h2 id="use">5. How to use it</h2>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="examples/demo.rs">examples/demo.rs</a></span><span>lines 6–25</span></figcaption><pre><code><span style="color: #A5D6FF">/// Parses `key=value;...` into pairs that live in `out`. All intermediate</span>
+<span style="color: #A5D6FF">/// data goes into a scratch arena and disappears when the function returns.</span>
+<span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">parse_config</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">a</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">(out:</span><span style="color: #6E7681"> </span><span style="color: #79C0FF">&amp;</span><span style="color: #FF7B72; font-weight: bold">'</span><span style="color: #E6EDF3">a</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Arena</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">text:</span><span style="color: #6E7681"> </span><span style="color: #79C0FF">&amp;</span><span style="color: #FF7B72">str</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #79C0FF">&amp;</span><span style="color: #FF7B72; font-weight: bold">'</span><span style="color: #E6EDF3">a</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[(</span><span style="color: #FF7B72; font-weight: bold">&amp;'</span><span style="color: #E6EDF3">a</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">str</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;'</span><span style="color: #E6EDF3">a</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">str</span><span style="color: #E6EDF3">)]</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">with_scratch(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">scratch</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">start</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">scratch.pos();</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">pairs:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Vec</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">str</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">str</span><span style="color: #E6EDF3">),</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">Arena</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Vec::new_in(scratch);</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">entry</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">in</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">text.split(</span><span style="color: #A5D6FF">';'</span><span style="color: #E6EDF3">).filter(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">e</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!</span><span style="color: #E6EDF3">e.is_empty())</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(k,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">v)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">entry.split_once(</span><span style="color: #A5D6FF">'='</span><span style="color: #E6EDF3">).unwrap_or((entry,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">""</span><span style="color: #E6EDF3">));</span>
+<span style="color: #6E7681">            </span><span style="color: #8B949E; font-style: italic">// Normalize keys in scratch memory first.</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">key</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">scratch.push_str(k.trim());</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">key.make_ascii_lowercase();</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">pairs.push((out.push_str(key),</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">out.push_str(v.trim())));</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">        </span><span style="color: #D2A8FF; font-weight: bold">println!</span><span style="color: #E6EDF3">(</span>
+<span style="color: #6E7681">            </span><span style="color: #A5D6FF">"  parse_config used {} scratch bytes"</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">scratch.pos().get()</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">-</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">start.get()</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">out.push_slice(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">pairs)</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">})</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="examples/demo.rs">examples/demo.rs</a></span><span>lines 27–43</span></figcaption><pre><code><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">main</span><span style="color: #E6EDF3">()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">out</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Arena::new();</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">config</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">parse_config(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">out,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"Width=1280; Height=720; VSync=on;"</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(k,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">v)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">in</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">config</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #D2A8FF; font-weight: bold">println!</span><span style="color: #E6EDF3">(</span><span style="color: #A5D6FF">"{k} = {v}"</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #D2A8FF; font-weight: bold">println!</span><span style="color: #E6EDF3">(</span><span style="color: #A5D6FF">"scratch arenas on this thread: {}"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_count());</span>
+
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// The output arena can itself be a scratch arena: the callee gets the</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// other one automatically, with no `conflicts` list.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">with_scratch(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">frame</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">config</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">parse_config(frame,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"Theme=dark;"</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">        </span><span style="color: #D2A8FF; font-weight: bold">println!</span><span style="color: #E6EDF3">(</span><span style="color: #A5D6FF">"parsed into a scratch arena: {:?}"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">config);</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">});</span>
+<span style="color: #6E7681">    </span><span style="color: #D2A8FF; font-weight: bold">println!</span><span style="color: #E6EDF3">(</span><span style="color: #A5D6FF">"scratch arenas on this thread: {}"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_count());</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">out.clear();</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<figure class="code out"><figcaption><span><span class="lang">Output</span> cargo run -p rad_scratch --example demo</span></figcaption><pre><code>  parse_config used 147 scratch bytes
+width = 1280
+height = 720
+vsync = on
+scratch arenas on this thread: 1
+  parse_config used 136 scratch bytes
+parsed into a scratch arena: [("theme", "dark")]
+scratch arenas on this thread: 2
+</code></pre></figure>
+<p>The first call uses one scratch arena. The second call runs while <code>main</code> holds a scratch arena as the output, so the callee gets a second one automatically, and the thread now has two, the same number RAD uses.</p>
+
+<h2 id="build">6. Building it yourself, step by step</h2>
+<ol class="steps">
+<li><b>Thread-local list of arenas</b>, boxed so each keeps its address when the list grows.</li>
+<li><b>Track which are in use.</b> A <code>RefCell</code> per arena gives you both the flag and exclusive access.</li>
+<li><b>Lend with a closure</b>, not a guard you return. A closure bounds the lifetime of the <code>&amp;Arena</code>, so results cannot escape.</li>
+<li><b>Pop on the way out</b> with a <code>Temp</code> inside the closure call.</li>
+<li><b>Test</b> that the position is restored, that an output arena that is itself scratch survives a nested call, and that nested scopes get distinct arenas.</li>
+</ol>
+
+<h2 id="tests">7. Tests</h2>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="tests/scratch.rs">tests/scratch.rs</a></span><span>lines 4–20</span></figcaption><pre><code><span style="color: #A5D6FF">/// Builds a string in `out`, using scratch memory for the pieces.</span>
+<span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">join</span><span style="color: #FF7B72; font-weight: bold">&lt;'</span><span style="color: #E6EDF3">a</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">(out:</span><span style="color: #6E7681"> </span><span style="color: #79C0FF">&amp;</span><span style="color: #FF7B72; font-weight: bold">'</span><span style="color: #E6EDF3">a</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Arena</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">parts:</span><span style="color: #6E7681"> </span><span style="color: #79C0FF">&amp;</span><span style="color: #E6EDF3">[</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">str</span><span style="color: #E6EDF3">])</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #79C0FF">&amp;</span><span style="color: #FF7B72; font-weight: bold">'</span><span style="color: #E6EDF3">a</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">str</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">with_scratch(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">scratch</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">pieces:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Vec</span><span style="color: #FF7B72; font-weight: bold">&lt;&amp;</span><span style="color: #FF7B72">str</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">Arena</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Vec::new_in(scratch);</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">p</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">in</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">parts</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">pieces.push(scratch.push_str(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">p.to_uppercase()));</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">total:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">pieces.iter().map(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">p</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">p.len()</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">).sum();</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">buf:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Vec</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #FF7B72">u8</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">Arena</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Vec::with_capacity_in(total,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">scratch);</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">p</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">in</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">pieces</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">buf.extend_from_slice(p.as_bytes());</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">buf.push(</span><span style="color: #A5D6FF">b'/'</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">buf.pop();</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">out.push_str(std::</span><span style="color: #FF7B72">str</span><span style="color: #E6EDF3">::from_utf8(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">buf).unwrap())</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">})</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="tests/scratch.rs">tests/scratch.rs</a></span><span>lines 35–50</span></figcaption><pre><code><span style="color: #8B949E; font-weight: bold; font-style: italic">#[test]</span>
+<span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">output_into_a_scratch_arena_survives_nested_scratch_use</span><span style="color: #E6EDF3">()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// `join` takes a scratch arena internally while the caller's output arena</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// is itself a scratch arena. It must not pick the same one, or popping it</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// would free the result. C needs `scratch_begin(&amp;out, 1)` for this.</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">std::thread::spawn(</span><span style="color: #FF7B72; font-weight: bold">||</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">with_scratch(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">out</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">path</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">join(out,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">[</span><span style="color: #A5D6FF">"usr"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"local"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"bin"</span><span style="color: #E6EDF3">]);</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">again</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">join(out,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">[</span><span style="color: #A5D6FF">"etc"</span><span style="color: #E6EDF3">]);</span>
+<span style="color: #6E7681">            </span><span style="color: #D2A8FF; font-weight: bold">assert_eq!</span><span style="color: #E6EDF3">((path,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">again),</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(</span><span style="color: #A5D6FF">"USR/LOCAL/BIN"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"ETC"</span><span style="color: #E6EDF3">));</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">});</span>
+<span style="color: #6E7681">        </span><span style="color: #D2A8FF; font-weight: bold">assert_eq!</span><span style="color: #E6EDF3">(arena_count(),</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">2</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">})</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">.join()</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">.unwrap();</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure>
+
+<h2 id="files">8. Full source</h2>
+<details class="file"><summary>Show the whole file: src/lib.rs (75 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–75</span></figcaption><pre><code><span style="color: #A5D6FF">//! A port of the RAD Debugger's scratch arenas (`src/base/base_thread_context.c`).</span>
+<span style="color: #A5D6FF">//!</span>
+<span style="color: #A5D6FF">//! Every thread has a few arenas for temporary work. A function that needs</span>
+<span style="color: #A5D6FF">//! scratch memory borrows one, uses it, and pops it back when it is done. In C:</span>
+<span style="color: #A5D6FF">//!</span>
+<span style="color: #A5D6FF">//! ```c</span>
+<span style="color: #A5D6FF">//! Temp scratch = scratch_begin(&amp;out_arena, 1);   // any arena except out_arena</span>
+<span style="color: #A5D6FF">//! ... push temporary data onto scratch.arena ...</span>
+<span style="color: #A5D6FF">//! ... push the result onto out_arena ...</span>
+<span style="color: #A5D6FF">//! scratch_end(scratch);</span>
+<span style="color: #A5D6FF">//! ```</span>
+<span style="color: #A5D6FF">//!</span>
+<span style="color: #A5D6FF">//! The `conflicts` list exists because popping a scratch arena that is also the</span>
+<span style="color: #A5D6FF">//! caller's output arena would free the result. C relies on every caller</span>
+<span style="color: #A5D6FF">//! passing the right list.</span>
+<span style="color: #A5D6FF">//!</span>
+<span style="color: #A5D6FF">//! In Rust, [`with_scratch`] lends an arena exclusively for the length of a</span>
+<span style="color: #A5D6FF">//! closure. An arena that is already lent out, such as one the caller is using</span>
+<span style="color: #A5D6FF">//! for its output, cannot be picked again, so there is no `conflicts` argument</span>
+<span style="color: #A5D6FF">//! to get wrong. And because the closure's return type cannot borrow the</span>
+<span style="color: #A5D6FF">//! scratch arena, scratch data cannot escape the scope:</span>
+<span style="color: #A5D6FF">//!</span>
+<span style="color: #A5D6FF">//! ```compile_fail</span>
+<span style="color: #A5D6FF">//! let leaked: &amp;str = rad_scratch::with_scratch(|s| s.push_str("temporary"));</span>
+<span style="color: #A5D6FF">//! ```</span>
+<span style="color: #A5D6FF">//!</span>
+<span style="color: #A5D6FF">//! The cost: C can reuse the caller's own scratch arena for a nested scratch</span>
+<span style="color: #A5D6FF">//! when it is not a conflict; here each nesting level takes another arena.</span>
+<span style="color: #A5D6FF">//! RAD keeps two per thread; this version creates more when scopes nest deeper.</span>
+
+<span style="color: #FF7B72">use</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">std::cell::RefCell;</span>
+
+<span style="color: #FF7B72">use</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">rad_arena::Arena;</span>
+
+<span style="color: #D2A8FF; font-weight: bold">thread_local!</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// C: `TCTX::arenas[2]`. Boxed so each arena keeps its address while the</span>
+<span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// `Vec` grows: `with_scratch` keeps a pointer to the arena while it runs.</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-weight: bold; font-style: italic">#[allow(clippy::vec_box)]</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">static</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">SCRATCH:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">RefCell</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Vec</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Box</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">RefCell</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Arena</span><span style="color: #FF7B72; font-weight: bold">&gt;&gt;&gt;&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">RefCell::new(Vec::new())</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #A5D6FF">/// Number of scratch arenas this thread has created so far.</span>
+<span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">arena_count</span><span style="color: #E6EDF3">()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">usize</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">SCRATCH.with(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">s</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">s.borrow().len())</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #A5D6FF">/// Runs `f` with a scratch arena that no enclosing `with_scratch` on this</span>
+<span style="color: #A5D6FF">/// thread is using, then pops it back to where it was.</span>
+<span style="color: #A5D6FF">/// C: `scratch_begin(conflicts, count)` ... `scratch_end(scratch)`.</span>
+<span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">with_scratch</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">R</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">(f:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">impl</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">FnOnce(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">Arena)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">R</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">R</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cell:</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">RefCell</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Arena</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">SCRATCH.with(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">s</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arenas</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">s.borrow_mut();</span>
+<span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// C: the loop in `tctx_get_scratch` that skips `conflicts`.</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">match</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arenas.iter().find(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">a</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">a.try_borrow_mut().is_ok())</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">Some(free)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=&gt;</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;**</span><span style="color: #E6EDF3">free</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">as</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">_,</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">None</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">                </span><span style="color: #E6EDF3">arenas.push(Box::new(RefCell::new(Arena::new())));</span>
+<span style="color: #6E7681">                </span><span style="color: #FF7B72; font-weight: bold">&amp;**</span><span style="color: #E6EDF3">arenas.last().expect(</span><span style="color: #A5D6FF">"just pushed"</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">as</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">_</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">});</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// SAFETY: the boxes are never removed or moved, and thread-local storage</span>
+<span style="color: #6E7681">    </span><span style="color: #8B949E; font-style: italic">// outlives any call running on its thread.</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cell</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;*</span><span style="color: #E6EDF3">cell</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cell.borrow_mut();</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">temp</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena.temp();</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">f(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">temp)</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #A5D6FF">/// Runs `f` with two scratch arenas at once, for code that ping-pongs between</span>
+<span style="color: #A5D6FF">/// buffers.</span>
+<span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">with_scratch2</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">R</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">(f:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">impl</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">FnOnce(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">Arena,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">Arena)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">R</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">R</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">with_scratch(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">a</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">with_scratch(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">b</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">f(a,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">b)))</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure></details>
+<details class="file"><summary>Show the whole file: original-c/base_thread_context.h (138 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.h">original-c/base_thread_context.h</a></span><span>lines 1–138</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">// Copyright (c) Epic Games Tools</span>
+<span style="color: #8B949E; font-style: italic">// Licensed under the MIT license (https://opensource.org/license/mit/)</span>
+
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#ifndef BASE_THREAD_CONTEXT_H</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define BASE_THREAD_CONTEXT_H</span>
+
+<span style="color: #8B949E; font-style: italic">////////////////////////////////</span>
+<span style="color: #8B949E; font-style: italic">//~ rjf: Lane Context</span>
+
+<span style="color: #FF7B72">typedef</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">LaneCtx</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LaneCtx;</span>
+<span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">LaneCtx</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">lane_idx;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">lane_count;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Barrier</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">barrier;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">broadcast_memory;</span>
+<span style="color: #E6EDF3">};</span>
+
+<span style="color: #8B949E; font-style: italic">////////////////////////////////</span>
+<span style="color: #8B949E; font-style: italic">//~ rjf: Access Scopes</span>
+
+<span style="color: #FF7B72">typedef</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">AccessPt</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">AccessPt;</span>
+<span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">AccessPt</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">access_refcount;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">last_time_touched_us;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">last_update_idx_touched;</span>
+<span style="color: #E6EDF3">};</span>
+
+<span style="color: #FF7B72">typedef</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">AccessPtExpireParams</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">AccessPtExpireParams;</span>
+<span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">AccessPtExpireParams</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">time;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">update_idxs;</span>
+<span style="color: #E6EDF3">};</span>
+
+<span style="color: #FF7B72">typedef</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Touch</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Touch;</span>
+<span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Touch</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">next;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">AccessPt</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">pt;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">CondVar</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cv;</span>
+<span style="color: #E6EDF3">};</span>
+
+<span style="color: #FF7B72">typedef</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Access</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Access;</span>
+<span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Access</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">next;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">top_touch;</span>
+<span style="color: #E6EDF3">};</span>
+
+<span style="color: #8B949E; font-style: italic">////////////////////////////////</span>
+<span style="color: #8B949E; font-style: italic">//~ rjf: Base Per-Thread State Bundle</span>
+
+<span style="color: #FF7B72">typedef</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">TCTX</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX;</span>
+<span style="color: #FF7B72">struct</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">TCTX</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: scratch arenas</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arenas[</span><span style="color: #A5D6FF">2</span><span style="color: #E6EDF3">];</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: thread name</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">thread_name[</span><span style="color: #A5D6FF">32</span><span style="color: #E6EDF3">];</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">thread_name_size;</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: lane context</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">LaneCtx</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">lane_ctx;</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: source location info</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">char</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">file_name;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">line_number;</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: accesses</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">access_arena;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">free_access;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">free_touch;</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: progress</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">progress_counter_ptr;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">progress_target_ptr;</span>
+<span style="color: #E6EDF3">};</span>
+
+<span style="color: #8B949E; font-style: italic">////////////////////////////////</span>
+<span style="color: #8B949E; font-style: italic">// Globals</span>
+
+<span style="color: #FF7B72">extern</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">thread_static</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx_thread_local;</span>
+
+<span style="color: #8B949E; font-style: italic">////////////////////////////////</span>
+<span style="color: #8B949E; font-style: italic">//~ rjf: Thread Context Functions</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: thread-context allocation &amp; selection</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx_alloc(</span><span style="color: #FF7B72">void</span><span style="color: #E6EDF3">);</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_release(TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx);</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_select(TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx);</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx_selected(</span><span style="color: #FF7B72">void</span><span style="color: #E6EDF3">);</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: scratch arenas</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx_get_scratch(Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">**</span><span style="color: #E6EDF3">conflicts,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">count);</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define scratch_begin(conflicts, count) temp_begin(tctx_get_scratch((conflicts), (count)))</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define scratch_end(scratch) temp_end(scratch)</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: lane metadata</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LaneCtx</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_set_lane_ctx(LaneCtx</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">lane_ctx);</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_lane_barrier_wait(</span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">broadcast_ptr,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_size,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_src_lane_idx);</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define lane_idx() (tctx_selected()-&gt;lane_ctx.lane_idx)</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define lane_count() (tctx_selected()-&gt;lane_ctx.lane_count)</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define lane_from_task_idx(idx) ((idx)%lane_count())</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define lane_ctx(ctx) tctx_set_lane_ctx((ctx))</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define lane_sync() tctx_lane_barrier_wait(0, 0, 0)</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define lane_sync_u64(ptr, src_lane_idx) tctx_lane_barrier_wait((ptr), sizeof(*(ptr)), (src_lane_idx))</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define lane_range(count) m_range_from_n_idx_m_count(lane_idx(), lane_count(), (count))</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: thread names</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_set_thread_name(String8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">name);</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">String8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_get_thread_name(</span><span style="color: #FF7B72">void</span><span style="color: #E6EDF3">);</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: thread source-locations</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_write_srcloc(</span><span style="color: #FF7B72">char</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">file_name,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">line_number);</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_read_srcloc(</span><span style="color: #FF7B72">char</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">**</span><span style="color: #E6EDF3">file_name,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">line_number);</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define tctx_write_this_srcloc() tctx_write_srcloc(__FILE__, __LINE__)</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: access scopes</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">access_open(</span><span style="color: #FF7B72">void</span><span style="color: #E6EDF3">);</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">access_close(Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">access);</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">access_touch(Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">access,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">AccessPt</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">pt,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">CondVar</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cv);</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: access points</span>
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">B32</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">access_pt_is_expired_(AccessPt</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">pt,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">AccessPtExpireParams</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">params);</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define access_pt_is_expired(pt, ...) access_pt_is_expired_((pt), &amp;(AccessPtExpireParams){.time = 2000000, .update_idxs = 2, __VA_ARGS__})</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: progress counters</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define set_progress_ptr(ptr) (tctx_selected()-&gt;progress_counter_ptr = (ptr))</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define set_progress_target_ptr(ptr) (tctx_selected()-&gt;progress_target_ptr = (ptr))</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define set_progress(val) (tctx_selected()-&gt;progress_counter_ptr ? ins_atomic_u64_eval_assign(tctx_selected()-&gt;progress_counter_ptr, (val)) : (void)0)</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define add_progress(val) (tctx_selected()-&gt;progress_counter_ptr ? ins_atomic_u64_add_eval(tctx_selected()-&gt;progress_counter_ptr, (val)) : (void)0)</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#define set_progress_target(val) (tctx_selected()-&gt;progress_target_ptr ? ins_atomic_u64_eval_assign(tctx_selected()-&gt;progress_target_ptr, (val)) : (void)0)</span>
+
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#endif </span><span style="color: #8B949E; font-style: italic">// BASE_THREAD_CONTEXT_H</span>
+</code></pre></figure></details>
+<details class="file"><summary>Show the whole file: original-c/base_thread_context.c (232 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.c">original-c/base_thread_context.c</a></span><span>lines 1–232</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">// Copyright (c) Epic Games Tools</span>
+<span style="color: #8B949E; font-style: italic">// Licensed under the MIT license (https://opensource.org/license/mit/)</span>
+
+<span style="color: #8B949E; font-style: italic">////////////////////////////////</span>
+<span style="color: #8B949E; font-style: italic">//~ rjf: Globals</span>
+
+<span style="color: #E6EDF3">thread_static</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx_thread_local;</span>
+
+<span style="color: #8B949E; font-style: italic">////////////////////////////////</span>
+<span style="color: #8B949E; font-style: italic">//~ rjf: Thread Context Functions</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: thread-context allocation &amp; selection</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span>
+<span style="color: #E6EDF3">tctx_alloc(</span><span style="color: #FF7B72">void</span><span style="color: #E6EDF3">)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#if PROFILE_TELEMETRY</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">thread_static</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">static</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">char</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">name[</span><span style="color: #A5D6FF">2</span><span style="color: #E6EDF3">][</span><span style="color: #A5D6FF">1024</span><span style="color: #E6EDF3">];</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">raddbg_snprintf(name[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">],</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">sizeof</span><span style="color: #E6EDF3">(name[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">]),</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"Scratch/0[TID:%u]"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tid());</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">raddbg_snprintf(name[</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">],</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">sizeof</span><span style="color: #E6EDF3">(name[</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">]),</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"Scratch/1[TID:%u]"</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tid());</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_0</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_alloc(.name</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">name[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">]);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_1</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_alloc(.name</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">name[</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">]);</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#else</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_0</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_alloc();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_1</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_alloc();</span>
+<span style="color: #8B949E; font-weight: bold; font-style: italic">#endif</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">push_array(arena_0,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_0;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas[</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_1;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">lane_ctx.lane_count</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span>
+<span style="color: #E6EDF3">tctx_release(TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">arena_release(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas[</span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">]);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">arena_release(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">]);</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span>
+<span style="color: #E6EDF3">tctx_select(TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx_thread_local</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span>
+<span style="color: #E6EDF3">tctx_selected(</span><span style="color: #FF7B72">void</span><span style="color: #E6EDF3">)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_thread_local;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: scratch arenas</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span>
+<span style="color: #E6EDF3">tctx_get_scratch(Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">**</span><span style="color: #E6EDF3">conflicts,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">count)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_selected();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">result</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">**</span><span style="color: #E6EDF3">arena_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas;</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">for</span><span style="color: #E6EDF3">(U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">ArrayCount(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">arenas);</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">)</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">Arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">**</span><span style="color: #E6EDF3">conflict_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">conflicts;</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">B32</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">has_conflict</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">for</span><span style="color: #E6EDF3">(U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">j</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">j</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">count;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">j</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">conflict_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">)</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">      </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">==</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">conflict_ptr)</span>
+<span style="color: #6E7681">      </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #E6EDF3">has_conflict</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">break</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">      </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">!</span><span style="color: #E6EDF3">has_conflict)</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">      </span><span style="color: #E6EDF3">result</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">arena_ptr;</span>
+<span style="color: #6E7681">      </span><span style="color: #FF7B72">break</span><span style="color: #E6EDF3">;</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">result;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: lane metadata</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">LaneCtx</span>
+<span style="color: #E6EDF3">tctx_set_lane_ctx(LaneCtx</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">lane_ctx)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_selected();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">LaneCtx</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">restore</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">lane_ctx;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">lane_ctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">lane_ctx;</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">restore;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span>
+<span style="color: #E6EDF3">tctx_lane_barrier_wait(</span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">broadcast_ptr,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_size,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_src_lane_idx)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">ProfBeginFunction();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">ProfColor(</span><span style="color: #A5D6FF">0x00000ff</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_selected();</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: doing broadcast -&gt; copy to broadcast memory on source lane</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_size_clamped</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">ClampTop(broadcast_size,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">sizeof</span><span style="color: #E6EDF3">(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">lane_ctx.broadcast_memory[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">]));</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(broadcast_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">lane_idx()</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">==</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_src_lane_idx)</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">MemoryCopy(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">lane_ctx.broadcast_memory,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_ptr,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_size_clamped);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: all cases: barrier</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">barrier_wait(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">lane_ctx.barrier);</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: doing broadcast -&gt; copy from broadcast memory on destination lanes</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(broadcast_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">lane_idx()</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_src_lane_idx)</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">MemoryCopy(broadcast_ptr,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">lane_ctx.broadcast_memory,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">broadcast_size_clamped);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #8B949E; font-style: italic">// rjf: doing broadcast -&gt; barrier on all lanes</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(broadcast_ptr</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">)</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">barrier_wait(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">lane_ctx.barrier);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">ProfEnd();</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: thread names</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span>
+<span style="color: #E6EDF3">tctx_set_thread_name(String8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">string)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_selected();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">ClampTop(string.size,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">sizeof</span><span style="color: #E6EDF3">(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">thread_name));</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">MemoryCopy(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">thread_name,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">string.str,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">thread_name_size</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">size;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">String8</span>
+<span style="color: #E6EDF3">tctx_get_thread_name(</span><span style="color: #FF7B72">void</span><span style="color: #E6EDF3">)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_selected();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">String8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">result</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">str8(tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">thread_name,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">thread_name_size);</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">result;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: thread source-locations</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span>
+<span style="color: #E6EDF3">tctx_write_srcloc(</span><span style="color: #FF7B72">char</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">file_name,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">line_number)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_selected();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">file_name</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">file_name;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">line_number</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">line_number;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span>
+<span style="color: #E6EDF3">tctx_read_srcloc(</span><span style="color: #FF7B72">char</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">**</span><span style="color: #E6EDF3">file_name,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">line_number)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">TCTX</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">tctx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_selected();</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">file_name</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">file_name;</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">line_number</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">line_number;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #8B949E; font-style: italic">////////////////////////////////</span>
+<span style="color: #8B949E; font-style: italic">//~ rjf: Touch Scope Functions</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span>
+<span style="color: #E6EDF3">access_open(</span><span style="color: #FF7B72">void</span><span style="color: #E6EDF3">)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">access_arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">==</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">)</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">access_arena</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">arena_alloc();</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">free_access;</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">)</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">SLLStackPop(tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">free_access);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">else</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">push_array_no_zero(tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">access_arena,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Access,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">MemoryZeroStruct(access);</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">access;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span>
+<span style="color: #E6EDF3">access_close(Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">access)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">for</span><span style="color: #E6EDF3">(Touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">access</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">top_touch,</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">next</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">next)</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">next</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">touch</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">next;</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">ins_atomic_u64_dec_eval(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">touch</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">pt</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">access_refcount);</span>
+<span style="color: #6E7681">    </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(touch</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">cv.u64[</span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cond_var_broadcast(touch</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">cv);</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">SLLStackPush(tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">free_touch,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">touch);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">SLLStackPush(tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">free_access,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">access);</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span>
+<span style="color: #E6EDF3">access_touch(Access</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">access,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">AccessPt</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">pt,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">CondVar</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cv)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">ins_atomic_u64_inc_eval(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">pt</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">access_refcount);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">ins_atomic_u64_eval_assign(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">pt</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">last_time_touched_us,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">now_time_us());</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">ins_atomic_u64_eval_assign(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">pt</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">last_update_idx_touched,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">update_tick_idx());</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">Touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">free_touch;</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">if</span><span style="color: #E6EDF3">(touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!=</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #E6EDF3">)</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">SLLStackPop(tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">free_touch);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">else</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">    </span><span style="color: #E6EDF3">touch</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">push_array_no_zero(tctx_thread_local</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">access_arena,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Touch,</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">MemoryZeroStruct(touch);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">SLLStackPush(access</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">top_touch,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">touch);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">touch</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">cv</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">cv;</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">touch</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">pt</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">pt;</span>
+<span style="color: #E6EDF3">}</span>
+
+<span style="color: #8B949E; font-style: italic">//- rjf: access points</span>
+
+<span style="color: #E6EDF3">internal</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">B32</span>
+<span style="color: #E6EDF3">access_pt_is_expired_(AccessPt</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">pt,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">AccessPtExpireParams</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">params)</span>
+<span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">access_refcount</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">ins_atomic_u64_eval(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">pt</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">access_refcount);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">last_time_touched_us</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">ins_atomic_u64_eval(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">pt</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">last_time_touched_us);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">U64</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">last_update_idx_touched</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">ins_atomic_u64_eval(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">pt</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">last_update_idx_touched);</span>
+<span style="color: #6E7681">  </span><span style="color: #E6EDF3">B32</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">result</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(access_refcount</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">==</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span>
+<span style="color: #6E7681">                </span><span style="color: #E6EDF3">last_time_touched_us</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">params</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">time</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">now_time_us()</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span>
+<span style="color: #6E7681">                </span><span style="color: #E6EDF3">last_update_idx_touched</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">params</span><span style="color: #FF7B72; font-weight: bold">-&gt;</span><span style="color: #E6EDF3">update_idxs</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">update_tick_idx());</span>
+<span style="color: #6E7681">  </span><span style="color: #FF7B72">return</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">result;</span>
+<span style="color: #E6EDF3">}</span>
+</code></pre></figure></details>
+</main>
+</div></body></html>

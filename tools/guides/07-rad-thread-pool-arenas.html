@@ -1,0 +1,84 @@
+<h1>RAD linker thread-pool arenas in Rust</h1>
+<p class="lede">An arena is not thread-safe, so a parallel job gives each worker thread its own arena. The RAD linker bundles those into a <code>TP_Arena</code> and saves and restores all of them together. In Rust, scoped threads and <code>&amp;mut</code> borrows make "one arena per thread" a guarantee instead of a convention.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>Pushing onto an arena moves its position without a lock. Two threads pushing onto the same arena at once would hand out overlapping memory. Adding a lock would make every allocation contend. The RAD linker's answer is to give each worker its own arena:</p>
+<div class="diagram"><pre>
+ main thread:   TP_Arena { v = [arena0, arena1, arena2] }
+                TP_Temp t = tp_temp_begin(arenas)       save pos of all three
+                tp_for_parallel(pool, arenas, 7 tasks)
+ worker 0:        tasks 0, 3, 6  → push results onto arena0
+ worker 1:        tasks 1, 4     → push results onto arena1
+ worker 2:        tasks 2, 5     → push results onto arena2
+ main thread:   read every task's result (they point into the three arenas)
+                tp_temp_end(t)                          pop all three back
+</pre></div>
+<p>No locks, no contention, and the results live until the main thread decides they are no longer needed.</p>
+
+<h2 id="c">2. The C version</h2>
+{{c-item original-c/thread_pool.h typedef struct TP_Arena}}
+{{c-item original-c/thread_pool.h typedef struct TP_Temp}}
+<p>Creating the set allocates one arena per worker, then stores the array of pointers inside the first arena.</p>
+{{c-item original-c/thread_pool.c tp_arena_alloc(TP_Context *pool)}}
+<p>Saving and restoring positions loops over every arena. The array of saved positions is itself pushed onto arena 0, which is why <code>tp_temp_end</code> restores arenas 1..n in its loop and relies on the order for arena 0.</p>
+{{c-item original-c/thread_pool.c tp_temp_begin(TP_Arena *arena)}}
+{{c-item original-c/thread_pool.c tp_temp_end(TP_Temp temp)}}
+<div class="warn"><b>Arena 0 is not popped.</b> <code>tp_temp_end</code>'s loop stops at index 1, so arena 0 keeps everything pushed during the scope (including the saved positions array). That may be deliberate, since the positions live there, but it means temp scopes leak into arena 0 until it is released.</div>
+<p>Nothing in C checks that a task only touches its own worker's arena. The task function receives the worker index and is trusted to use it.</p>
+
+<h2 id="rust">3. The Rust version</h2>
+{{rs-item src/lib.rs pub struct WorkerArenas}}
+<h3>Running tasks in parallel</h3>
+<p><code>for_parallel</code> starts one scoped thread per arena and hands it <code>&amp;mut</code> that arena via <code>iter_mut()</code>. The compiler knows each <code>&amp;mut</code> is unique, so two threads can never share an arena. Task <code>i</code> runs on worker <code>i % workers</code>, and the results come back in task order.</p>
+{{rs-item src/lib.rs pub fn for_parallel}}
+<p>Three type-level facts carry the safety argument:</p>
+<ul>
+<li><b><code>Arena: Send</code></b>, so an arena (or <code>&amp;mut</code> to one) may move to a worker thread.</li>
+<li><b><code>Arena: !Sync</code></b>, so <code>&amp;Arena</code> cannot be shared between threads. A task cannot smuggle its arena to another thread.</li>
+<li><b>Results borrow <code>'a</code></b>, the lifetime of <code>&amp;'a mut self</code>. Results such as <code>&amp;[T]</code> pointing into worker arenas keep those arenas borrowed, so they cannot be popped while the results are alive.</li>
+</ul>
+<h3>Saving and restoring all positions</h3>
+{{rs-item src/lib.rs pub fn temp(}}
+{{rs-item src/lib.rs impl Drop for WorkerTemp}}
+<p>All arenas, including the first, are popped. The saved positions live in an ordinary <code>Vec</code>, not in an arena.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> does not compile (doc test in src/lib.rs)</span></figcaption><pre><code>let mut arenas = WorkerArenas::new(2);
+let mut temp = arenas.temp();
+let words = temp.for_parallel(4, |arena, i| arena.push_str(&amp;i.to_string()) as &amp;str);
+drop(temp); // error[E0505]: cannot move out of `temp` because it is borrowed
+println!("{words:?}");</code></pre></figure>
+
+<h2 id="compare">4. Side by side</h2>
+<table>
+<tr><th></th><th>C (RAD linker)</th><th>Rust port</th></tr>
+<tr><td>Arena set</td><td><code>TP_Arena { count, v }</code>, array stored in arena 0</td><td><code>Vec&lt;Arena&gt;</code></td></tr>
+<tr><td>Threads</td><td>Persistent pool, barriers</td><td>Scoped threads per job</td></tr>
+<tr><td>One arena per thread</td><td>Convention: use your worker index</td><td class="yes">Enforced: each thread gets a unique <code>&amp;mut</code></td></tr>
+<tr><td>Sharing an arena across threads</td><td class="no">Compiles, races</td><td class="yes">Compile error (<code>Arena</code> is not <code>Sync</code>)</td></tr>
+<tr><td>Save / restore</td><td><code>tp_temp_begin</code> / <code>tp_temp_end</code></td><td><code>arenas.temp()</code>, ended by <code>Drop</code></td></tr>
+<tr><td>Arena 0 restored</td><td>No</td><td>Yes</td></tr>
+<tr><td>Popping while results are alive</td><td class="no">Allowed</td><td class="yes">Compile error</td></tr>
+</table>
+<div class="note">The real cost of this port is the thread spawn per worker per job. A persistent pool would avoid it; the safety argument would be the same as long as the pool hands each worker <code>&amp;mut</code> its own arena for the duration of a job.</div>
+
+<h2 id="use">5. How to use it</h2>
+{{rs-item examples/demo.rs fn main}}
+{{output rad_tp_arena demo}}
+<p>Seven "object files" are parsed by three workers; worker 0 got three tasks and the others two, which matches the positions shown. After the scope, every arena is back at 128 bytes, just its header.</p>
+
+<h2 id="build">6. Building it yourself, step by step</h2>
+<ol class="steps">
+<li><b>Make the arena <code>Send</code> but not <code>Sync</code>.</b> That is the honest description of a lock-free bump allocator.</li>
+<li><b>Keep one arena per worker</b> in a <code>Vec</code>.</li>
+<li><b>Hand them out with <code>iter_mut()</code></b> inside <code>std::thread::scope</code>, so each thread gets a unique borrow and all threads finish before the scope returns.</li>
+<li><b>Tie results to the borrow</b> by giving the task closure <code>&amp;'a Arena</code> and returning <code>Vec&lt;R&gt;</code> from a method taking <code>&amp;'a mut self</code>.</li>
+<li><b>Add a group temp</b> that saves every position and pops them all in <code>Drop</code>.</li>
+<li><b>Test</b> result order, task-to-worker mapping, that the temp restores every arena, and more workers than tasks.</li>
+</ol>
+
+<h2 id="tests">7. Tests</h2>
+{{rs-item tests/tp_arena.rs fn temp_pops_every_worker_arena}}
+
+<h2 id="files">8. Full source</h2>
+{{rs-file src/lib.rs}}
+{{c-file original-c/thread_pool.h}}
+{{c-file original-c/thread_pool.c}}

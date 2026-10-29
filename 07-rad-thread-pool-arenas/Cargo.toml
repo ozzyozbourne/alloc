@@ -1,0 +1,13 @@
+[package]
+name = "rad_tp_arena"
+version = "0.1.0"
+description = "The RAD linker's per-worker arenas (TP_Arena), ported to Rust"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rad_arena.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,118 @@
+<h1>Kohi dynamic allocator in Rust</h1>
+<p class="lede">Kohi's general-purpose heap: a freelist over one big block, with per-allocation headers, memory tags for usage reports, debug guard bytes, and a mutex. Every <code>kallocate</code> in the engine goes through it. The Rust port does all of that, and can also be the Rust program's <code>#[global_allocator]</code>.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>At startup Kohi asks the OS for one large block. From then on, every allocation in the engine is carved out of that block by a <a href="../03-kohi-freelist/guide.html">freelist</a>. The engine gets three things a plain <code>malloc</code> does not give it:</p>
+<ul>
+<li><b>A memory budget.</b> The engine cannot use more than the block.</li>
+<li><b>Usage by subsystem.</b> Every allocation carries a tag (<code>MEMORY_TAG_TEXTURE</code>, <code>MEMORY_TAG_GAME</code>, …), and the memory system keeps a byte count per tag.</li>
+<li><b>Debugging.</b> In debug builds each allocation records the file and line that made it, and guard bytes around the data catch writes past either end.</li>
+</ul>
+<p>Each allocation takes more bytes from the freelist than the user asked for:</p>
+<div class="diagram"><pre>
+ C (Kohi):    [ padding ][ u32 size ][ guard ][   user data   ][ guard ][ alloc_header: start, align, tag, file, line ]
+                                              ^ returned pointer
+
+ Rust port:   [ padding ][ Header: start, tag, site ][ guard ][   user data   ][ guard ]
+                                                              ^ returned pointer
+</pre></div>
+<p>Why the difference? <code>kfree(ptr)</code> receives only a pointer, so C must store the size right before the data to find everything else. Rust's <code>Allocator::deallocate(ptr, layout)</code> always receives the size and alignment, so the Rust header does not need to store them.</p>
+
+<h2 id="c">2. The C version</h2>
+<h3>The header</h3>
+{{c-item original-c/dynamic_allocator.c typedef struct alloc_header {}}
+<h3>Creating it</h3>
+<p>The block is laid out as <code>[state][freelist nodes][user memory]</code>. As with the freelist, you call <code>create</code> once to learn the size and again with memory.</p>
+{{c-item original-c/dynamic_allocator.c b8 dynamic_allocator_create (}}
+<h3>Allocating</h3>
+<p>It always asks the freelist for <code>alignment + header + 4 + size</code> (plus guards), enough for the worst-case padding, then places the user block inside that range.</p>
+{{c-item original-c/dynamic_allocator.c void *dynamic_allocator_allocate_aligned (}}
+<h3>Freeing</h3>
+<p>From the pointer alone it reads the stored size, finds the header after the data, recomputes the same <code>required_size</code>, and gives the range back.</p>
+{{c-item original-c/dynamic_allocator.c b8 dynamic_allocator_free_aligned (}}
+<h3>The memory system on top</h3>
+<p><code>kmemory.c</code> wraps the allocator in a mutex, keeps the per-tag statistics, and zeroes every allocation. <code>kallocate(size, tag)</code> is a macro that adds <code>__FILE__</code> and <code>__LINE__</code>.</p>
+{{c-item original-c/kmemory.c void *_kallocate_aligned (}}
+{{c-item original-c/kmemory.c void kfree_aligned (}}
+
+<h2 id="bugs">3. Notes on the C version</h2>
+<div class="bug"><b>Shutdown uses freed memory.</b> <code>memory_system_shutdown</code> destroys the mutex and frees the whole block (which contains the mutex), then calls <code>kmutex_unlock(&amp;state_ptr-&gt;allocation_mutex)</code> after the <code>if</code>.</div>
+{{c-item original-c/kmemory.c void memory_system_shutdown (}}
+<div class="warn"><b>4 GiB limit.</b> The size is stored in a <code>u32</code>, so allocations are capped by an assertion.</div>
+<div class="warn"><b>Off-by-one range check.</b> <code>dynamic_allocator_free_aligned</code> rejects <code>block &gt; memory_block + total_size</code>, so a pointer exactly at the end passes. <code>get_size_alignment</code> uses <code>&gt;=</code>.</div>
+<div class="note">Every <code>kallocate</code> zeroes the memory it returns. Rust leaves that choice to the caller: <code>allocate</code> does not zero, <code>allocate_zeroed</code> does.</div>
+
+<h2 id="rust">4. The Rust version</h2>
+<h3>Tags and the header</h3>
+{{rs-item src/lib.rs pub enum MemoryTag}}
+{{rs-item src/lib.rs struct Header {}}
+<p>Instead of C's 256-byte file name buffer, the header stores a <code>&amp;'static Location</code>, which is one pointer to the file, line and column the compiler already embeds in the binary.</p>
+<h3>How big a range an allocation needs</h3>
+<p>This function is the contract between <code>allocate</code> and <code>deallocate</code>: it depends only on the <code>Layout</code>, so freeing computes exactly the number allocation used. If the two ever disagreed, the freelist would leak or double-free; the test <code>freeing_everything_in_any_order_restores_all_free_space</code> checks they agree.</p>
+{{rs-item src/lib.rs fn required_size}}
+<h3>The allocator and its block</h3>
+<p>The freelist's nodes live <em>inside</em> the managed block, like C. <code>RawNodes</code> is the storage type that points there, and the whole mutable state sits behind a <code>Mutex</code>, so the allocator is <code>Sync</code> and threads can share it.</p>
+{{rs-item src/lib.rs pub struct DynamicAllocator<'m>}}
+{{rs-item src/lib.rs unsafe fn from_raw}}
+<h3>Allocating</h3>
+<p>Take a range from the freelist, align the user pointer inside it, write the header in front and the guards on both sides, and update the stats, all under the lock.</p>
+{{rs-item src/lib.rs fn allocate_tagged(}}
+<h3>Freeing</h3>
+<p>Check the guards, read the header for the range's start and tag, recompute <code>required_size</code> from the layout, and give the range back. If the freelist rejects it (a double free, for example), the allocator aborts, matching C's <code>KFATAL</code>.</p>
+{{rs-item src/lib.rs unsafe fn deallocate_impl}}
+{{rs-item src/lib.rs unsafe impl Allocator for DynamicAllocator}}
+<h3>Tags: a handle instead of a parameter</h3>
+<p><code>Allocator::allocate</code> has no room for a tag argument. So <code>heap.tagged(MemoryTag::Game)</code> returns a small <code>Copy</code> handle that remembers the tag and, through <code>#[track_caller]</code>, the source location of the <code>tagged</code> call. That handle is itself an <code>Allocator</code>: <code>Vec::new_in(heap.tagged(MemoryTag::Game))</code> tags every buffer that vector allocates.</p>
+{{rs-item src/lib.rs pub fn tagged}}
+{{rs-item src/lib.rs unsafe impl Allocator for Tagged}}
+<h3>As the global allocator</h3>
+<p>Kohi routes the whole engine through this heap. <code>GlobalHeap&lt;N&gt;</code> does the same for a Rust program: it is a <code>static</code> holding an <code>N</code>-byte buffer, builds the allocator inside it on first use, and implements <code>GlobalAlloc</code>. This only works because the allocator never allocates anywhere else; a <code>Box&lt;[Node]&gt;</code> for the freelist would call the global allocator from inside the global allocator.</p>
+{{rs-item src/lib.rs pub struct GlobalHeap}}
+{{rs-item src/lib.rs unsafe impl<const N: usize> GlobalAlloc for GlobalHeap}}
+
+<h2 id="compare">5. Side by side</h2>
+<table>
+<tr><th></th><th>C (Kohi)</th><th>Rust port</th></tr>
+<tr><td>Free search</td><td>First fit over a freelist</td><td>Same (<code>kohi_freelist</code>)</td></tr>
+<tr><td>Freelist nodes</td><td>Inside the block</td><td>Inside the block</td></tr>
+<tr><td>Size on free</td><td>Stored in a <code>u32</code> before the data</td><td>Given by <code>Layout</code>; not stored</td></tr>
+<tr><td>Max allocation</td><td>4 GiB</td><td>Region size</td></tr>
+<tr><td>Header position</td><td>After the data</td><td>Before the data</td></tr>
+<tr><td>Tag</td><td>Argument of every <code>kallocate</code></td><td><code>Tagged</code> handle passed to <code>*_in</code></td></tr>
+<tr><td>Allocation site</td><td>256-byte file name + line, debug only</td><td><code>&amp;'static Location</code>, debug only</td></tr>
+<tr><td>Guards</td><td>16 bytes each side under <code>MEM_DEBUG_TRACE</code></td><td>Same pattern, in debug builds</td></tr>
+<tr><td>Thread safety</td><td><code>kmutex</code> in the memory system</td><td><code>Mutex</code> inside the allocator; type is <code>Sync</code></td></tr>
+<tr><td>Zeroing</td><td>Always</td><td>Only for <code>allocate_zeroed</code></td></tr>
+<tr><td>Engine-wide use</td><td><code>kallocate</code> / <code>kfree</code></td><td><code>#[global_allocator] static HEAP: GlobalHeap&lt;N&gt;</code></td></tr>
+</table>
+
+<h2 id="use">6. How to use it</h2>
+<h3>As an allocator you pass around</h3>
+{{rs-item examples/demo.rs fn main}}
+{{output kohi_dynamic demo}}
+<p>The last part shows fragmentation, the main weakness of a freelist heap: after freeing every other block, half the heap is free, but no single hole is big enough for a 4 KB request. Once everything is freed, the ranges merge back into one and all 1,048,576 bytes are free again.</p>
+<h3>As the global allocator</h3>
+{{rs-item examples/global_allocator.rs fn main}}
+{{output kohi_dynamic global_allocator}}
+<p>Even the <code>HashMap</code>, the thread spawn and std's own start-up allocations land in the Kohi heap. They are tagged <code>UNKNOWN</code>, because <code>GlobalAlloc</code> has no way to pass a tag.</p>
+
+<h2 id="build">7. Building it yourself, step by step</h2>
+<ol class="steps">
+<li><b>Start from a range allocator</b> (folder 03) that hands out offsets.</li>
+<li><b>Write a pure function from <code>Layout</code> to range size</b>, including headers, guards and worst-case alignment padding. Use it in both <code>allocate</code> and <code>deallocate</code>.</li>
+<li><b>Lay out each allocation:</b> align the user pointer inside the range and put a header where you can find it from the user pointer. Store the range's start, because the user pointer is not at the start.</li>
+<li><b>Lock.</b> An allocator shared by threads must be <code>Sync</code>; wrap the freelist in a <code>Mutex</code> and keep the critical section short.</li>
+<li><b>Never panic in allocator methods.</b> Return <code>AllocError</code> for "no memory"; abort for corruption.</li>
+<li><b>For a global allocator</b>, make sure nothing inside allocates through the global allocator, including the node storage and lazy initialization.</li>
+<li><b>Test</b> random allocate/free sequences that end with "everything freed means all space is free", alignment up to a page, threads, and a deliberate overrun that the guards must catch.</li>
+</ol>
+
+<h2 id="tests">8. Tests</h2>
+{{rs-item tests/dynamic.rs fn freeing_everything_in_any_order_restores_all_free_space}}
+{{rs-item tests/dynamic.rs fn guards_detect_a_write_past_the_end}}
+
+<h2 id="files">9. Full source</h2>
+{{rs-file src/lib.rs}}
+{{c-file original-c/dynamic_allocator.h}}
+{{c-file original-c/dynamic_allocator.c}}
+{{c-file original-c/kmemory.c}}

@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "01-kohi-linear-allocator",
+    "02-kohi-pool-allocator",
+    "03-kohi-freelist",
+    "04-kohi-dynamic-allocator",
+    "05-rad-arena",
+    "06-rad-scratch-arenas",
+    "07-rad-thread-pool-arenas",
+]
+
+[workspace.package]
+edition = "2024"
+# `std::alloc::Allocator`, `Box::new_in` and `Vec::new_in` are stable from 1.100.0.
+rust-version = "1.100"
+publish = false
+
+[workspace.dependencies]
+libc = "0.2"
+kohi_freelist = { path = "03-kohi-freelist" }
+rad_arena = { path = "05-rad-arena" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"

@@ -1,0 +1,81 @@
+<h1>RAD Debugger scratch arenas in Rust</h1>
+<p class="lede">Per-thread arenas for temporary work, borrowed and popped back around a function body. In C the caller must list the arenas the callee may not use; in Rust the borrow checker makes that list unnecessary.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>Most functions need temporary memory: a list being built, a string being formatted, a lookup table. In RAD, functions take an output arena for their <em>result</em> and get temporary memory from a thread-local <em>scratch</em> arena, which they pop back before returning:</p>
+<figure class="code c"><figcaption><span><span class="lang">C</span> the RAD pattern</span></figcaption><pre><code>String8 join_paths(Arena *out, String8List parts)
+{
+  Temp scratch = scratch_begin(&amp;out, 1);   // a scratch arena that is not `out`
+  ... temporary work on scratch.arena ...
+  String8 result = push_str8_copy(out, ...);
+  scratch_end(scratch);                     // pop everything temporary
+  return result;
+}</code></pre></figure>
+<p>The <code>&amp;out, 1</code> argument is the <b>conflicts</b> list. Suppose the caller itself used a scratch arena as <code>out</code>. If <code>join_paths</code> picked that same arena as its scratch, then <code>scratch_end</code> would pop it back to where it was <em>before the result was pushed</em>, and the returned string would point at freed memory. So each thread has two scratch arenas, and the callee picks one that is not in the conflicts list.</p>
+<div class="diagram"><pre>
+ caller:     Temp a = scratch_begin(0, 0);          → scratch arena 0
+             join_paths(a.arena, parts);
+ callee:       scratch_begin(&amp;out = arena 0, 1);    → arena 0 is a conflict → scratch arena 1
+               result pushed to arena 0 (out)
+               scratch_end → pops arena 1 only       ✓ result survives
+</pre></div>
+<p>The scheme is fast and simple, but correctness depends on every function passing the right conflicts. Forget one and you get a use-after-free that only shows up when the arenas happen to collide.</p>
+
+<h2 id="c">2. The C version</h2>
+<p>Each thread's context holds two arenas, created when the thread starts. The context struct itself is pushed onto the first one.</p>
+{{c-item original-c/base_thread_context.h struct TCTX}}
+{{c-item original-c/base_thread_context.c tctx_alloc(void)}}
+<p>Picking a scratch arena is a search for the first one that is not in <code>conflicts</code>. Note that it returns 0 if both are conflicts.</p>
+{{c-item original-c/base_thread_context.c tctx_get_scratch(Arena **conflicts, U64 count)}}
+<p><code>scratch_begin</code> and <code>scratch_end</code> are just <code>temp_begin</code>/<code>temp_end</code> (folder 05) on that arena:</p>
+{{c-lines original-c/base_thread_context.h 98-99}}
+
+<h2 id="rust">3. The Rust version</h2>
+<p>The thread-local storage holds a growable list of arenas, each in a <code>RefCell</code>. A <code>RefCell</code> tracks at run time whether it is borrowed, and that is the key: an arena that is lent out to any enclosing scope is <em>borrowed</em>, so it is automatically a conflict.</p>
+{{rs-item src/lib.rs thread_local! {}}
+<p><code>with_scratch</code> picks the first arena that can be borrowed mutably (i.e. no enclosing scope on this thread is using it), creates a new one if all are busy, starts a <code>Temp</code> on it, and runs your closure. When the closure returns, the <code>Temp</code> drops and pops the arena back, and the <code>RefCell</code> borrow ends.</p>
+{{rs-item src/lib.rs pub fn with_scratch<R>}}
+<h3>Why there is no conflicts list</h3>
+<p>The caller's output arena, if it is a scratch arena, is borrowed by the caller's own <code>with_scratch</code> call for as long as the caller runs. So when the callee asks for a scratch arena, that one is skipped by <code>try_borrow_mut</code>. There is nothing to pass and nothing to forget.</p>
+<h3>Scratch data cannot escape</h3>
+<p>The closure receives <code>&amp;Arena</code> with a lifetime that ends when <code>with_scratch</code> returns. The return type <code>R</code> is chosen outside the call, so it cannot mention that lifetime:</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> does not compile (doc test in src/lib.rs)</span></figcaption><pre><code>let leaked: &amp;str = rad_scratch::with_scratch(|s| s.push_str("temporary"));
+// error: lifetime may not live long enough</code></pre></figure>
+<p>In C, returning a <code>String8</code> that was pushed onto the scratch arena instead of <code>out</code> compiles and returns a dangling pointer.</p>
+
+<h2 id="compare">4. Side by side</h2>
+<table>
+<tr><th></th><th>C (RAD)</th><th>Rust port</th></tr>
+<tr><td>Arenas per thread</td><td>Exactly 2</td><td>Created on demand; as many as the deepest nesting</td></tr>
+<tr><td>Begin / end</td><td><code>scratch_begin(conflicts, n)</code> / <code>scratch_end(t)</code></td><td><code>with_scratch(|s| ...)</code></td></tr>
+<tr><td>Avoiding the output arena</td><td>Caller passes conflicts</td><td class="yes">Automatic: a borrowed arena is skipped</td></tr>
+<tr><td>Forgetting <code>scratch_end</code></td><td>Leaks until the arena is cleared</td><td class="yes">Impossible; the scope ends with the closure</td></tr>
+<tr><td>Returning scratch data</td><td class="no">Compiles, dangles</td><td class="yes">Compile error</td></tr>
+<tr><td>All arenas conflict</td><td>Returns 0</td><td>Makes a new arena</td></tr>
+<tr><td>Reusing a non-conflicting outer scratch</td><td>Yes: a callee may share the caller's scratch arena if it is not the output</td><td>No: each nesting level gets its own arena</td></tr>
+</table>
+<div class="note">That last row is the real cost. RAD's two arenas suffice for any depth because the same arena is reused at alternating levels, safely, as long as each level pops only what it pushed. The Rust version cannot prove that alternation is safe, so it takes one arena per open scope. Since arenas only reserve address space and commit on demand, the extra arenas are cheap.</div>
+
+<h2 id="use">5. How to use it</h2>
+{{rs-item examples/demo.rs fn parse_config}}
+{{rs-item examples/demo.rs fn main}}
+{{output rad_scratch demo}}
+<p>The first call uses one scratch arena. The second call runs while <code>main</code> holds a scratch arena as the output, so the callee gets a second one automatically, and the thread now has two, the same number RAD uses.</p>
+
+<h2 id="build">6. Building it yourself, step by step</h2>
+<ol class="steps">
+<li><b>Thread-local list of arenas</b>, boxed so each keeps its address when the list grows.</li>
+<li><b>Track which are in use.</b> A <code>RefCell</code> per arena gives you both the flag and exclusive access.</li>
+<li><b>Lend with a closure</b>, not a guard you return. A closure bounds the lifetime of the <code>&amp;Arena</code>, so results cannot escape.</li>
+<li><b>Pop on the way out</b> with a <code>Temp</code> inside the closure call.</li>
+<li><b>Test</b> that the position is restored, that an output arena that is itself scratch survives a nested call, and that nested scopes get distinct arenas.</li>
+</ol>
+
+<h2 id="tests">7. Tests</h2>
+{{rs-item tests/scratch.rs fn join<'a>}}
+{{rs-item tests/scratch.rs fn output_into_a_scratch_arena_survives_nested_scratch_use}}
+
+<h2 id="files">8. Full source</h2>
+{{rs-file src/lib.rs}}
+{{c-file original-c/base_thread_context.h}}
+{{c-file original-c/base_thread_context.c}}

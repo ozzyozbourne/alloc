@@ -1,0 +1,114 @@
+<h1>RAD Debugger arena in Rust</h1>
+<p class="lede">The one allocator the whole RAD Debugger is built on: a stack of bytes backed by reserved virtual memory, which commits pages as it grows, chains new blocks when it fills up, and is freed by popping back to a saved position. This is the most complete port in the guide.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>An arena is a linear allocator (folder 01) with three upgrades:</p>
+<ol>
+<li><b>It pops to any position, not just to zero.</b> Save <code>pos</code>, do some work, pop back to <code>pos</code>. That is a stack, and it gives temporary memory scopes (<code>Temp</code>).</li>
+<li><b>It reserves address space, not memory.</b> Each block reserves 64 MiB of address space, which costs nothing, and commits real pages in 64 KiB steps only as the position reaches them.</li>
+<li><b>It never runs out (until the OS does).</b> When a block's reservation is full, it reserves another block and links it to the previous one. Positions keep counting across blocks.</li>
+</ol>
+<div class="diagram"><pre>
+ block 1 (reserve 64 MiB)                                block 2 (chained)
+ ┌────────┬──────────────────────┬──────────┬─────────┐   ┌────────┬───────────┬──────────────┐
+ │ header │  allocations ...     │ committed│ reserved│ ← │ header │ alloc ... │   reserved   │
+ │ 128 B  │                      │  unused  │ only    │   │ 128 B  │           │              │
+ └────────┴──────────────────────┴──────────┴─────────┘   └────────┴───────────┴──────────────┘
+          base_pos = 0                                     base_pos = 64 MiB     ^ current->pos
+ arena_pos() = current->base_pos + current->pos      (one number across the whole chain)
+</pre></div>
+<p>RAD's style is to give every kind of data a lifetime and an arena with that lifetime: one per view, one per frame, one per debug-info load. When the lifetime ends, the whole arena is popped or released at once. There is no per-object free and no general heap, and in the C code that removes whole classes of leak and double-free bugs.</p>
+
+<h2 id="c">2. The C version</h2>
+<h3>Types</h3>
+<p>The <code>Arena</code> struct is also the header of each block: <code>arena-&gt;current</code> is the block being filled, and each block links to the previous one with <code>prev</code>.</p>
+{{c-item original-c/base_arena.h struct ArenaParams}}
+{{c-item original-c/base_arena.h Arena *prev;    // previous arena in chain}}
+{{c-item original-c/base_arena.h struct Temp}}
+<h3>Reserve, commit, release</h3>
+<p>On Linux these are thin wrappers around <code>mmap</code> with <code>PROT_NONE</code> (reserve address space), <code>mprotect</code> to read/write (commit), and <code>munmap</code> (release).</p>
+{{c-item original-c/linux_base_memory_excerpt.c reserve_memory(U64 size)}}
+{{c-item original-c/linux_base_memory_excerpt.c commit_memory(void *ptr, U64 size)}}
+<h3>Creating an arena</h3>
+<p>Rounds the sizes to pages, reserves, commits the first part, and writes the header into the first 128 bytes. Most of the length is the optional global debug table.</p>
+{{c-item original-c/base_arena.c arena_alloc_(ArenaParams *params)}}
+<h3>Pushing</h3>
+<p>Align the position; if it does not fit in this block, chain a new one (or reuse one from the free list); commit pages if needed; return the pointer and optionally zero it. Out of memory aborts the process, so callers never see a null pointer.</p>
+{{c-item original-c/base_arena.c arena_push(Arena *arena, U64 size, U64 align, B32 zero)}}
+<h3>Popping and temp scopes</h3>
+<p>Popping releases whole blocks above the target position, then moves the position inside the remaining block. <code>temp_begin</code>/<code>temp_end</code> just save and restore a position.</p>
+{{c-item original-c/base_arena.c arena_pop_to(Arena *arena, U64 pos)}}
+{{c-item original-c/base_arena.c temp_begin(Arena *arena)}}
+{{c-item original-c/base_arena.c temp_end(Temp temp)}}
+<p>Like every arena in C, nothing stops code from keeping a pointer across <code>temp_end</code>. RAD relies on conventions and ASan poisoning (the <code>AsanPoisonMemoryRegion</code> calls) to catch that.</p>
+
+<h2 id="rust">3. The Rust version</h2>
+<h3>Reserve, commit, release</h3>
+<p>Same system calls through the <code>libc</code> crate. On non-Unix targets, and under Miri, which cannot run <code>mmap</code>, a fallback allocates each block up front from <code>System</code>.</p>
+{{rs-item src/os.rs pub fn reserve(}}
+{{rs-item src/os.rs pub unsafe fn commit(}}
+<h3>Types</h3>
+<p>The block header is a separate <code>Block</code> struct written at the start of each block, as in C. The <code>Arena</code> value you hold is a small handle with the current block (in a <code>Cell</code>, since <code>allocate</code> takes <code>&amp;self</code>) and the settings used for new blocks. A compile-time assertion checks the header fits in 128 bytes, the same as C's <code>StaticAssert</code>.</p>
+{{rs-item src/lib.rs struct Block {}}
+{{rs-item src/lib.rs pub struct Arena {}}
+<h3>Pushing</h3>
+<p>The same three steps as <code>arena_push</code>: fit in the current block, otherwise chain a block big enough for the request, then commit pages up to the new end. Every failure returns <code>AllocError</code>.</p>
+{{rs-item src/lib.rs fn push_raw(}}
+<h3>Popping</h3>
+<p><code>pop_to</code>, <code>pop</code> and <code>clear</code> take <code>&amp;mut self</code>. Anything allocated from the arena holds a shared borrow, so the compiler rejects a pop while any of it is still in use. That replaces ASan as the guard against use-after-pop, at compile time and in release builds:</p>
+{{rs-item src/lib.rs pub fn pop_to(}}
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> does not compile (doc test in src/lib.rs)</span></figcaption><pre><code>let mut arena = Arena::new();
+let name = arena.push_str("dangling");
+arena.clear(); // error[E0502]: `arena` is still borrowed by `name`
+println!("{name}");</code></pre></figure>
+<h3>Temp scopes</h3>
+<p><code>Temp</code> holds <code>&amp;mut Arena</code> and the saved position, and pops back in <code>Drop</code>. It dereferences to <code>Arena</code>, so you allocate from it directly, and scopes nest with <code>temp.temp()</code>. Because it borrows the arena mutably, nothing outside the scope can use the arena while the scope is open, and nothing allocated inside can outlive it.</p>
+{{rs-item src/lib.rs pub struct Temp<'a>}}
+{{rs-item src/lib.rs impl Drop for Temp}}
+<h3>Implementing <code>Allocator</code></h3>
+<p>Beyond the required two methods, the arena overrides <code>grow</code> and <code>shrink</code>. A <code>Vec</code> that is the most recent allocation can grow in place by moving the top up, so pushing to it never copies. <code>deallocate</code> also reclaims space when you free the most recent allocation, which makes short-lived <code>Box</code>es free. Anything else waits for a pop.</p>
+{{rs-item src/lib.rs unsafe impl Allocator for Arena}}
+<h3>C-style helpers</h3>
+<p><code>push</code>, <code>push_slice</code> and <code>push_str</code> mirror <code>push_array</code> and <code>push_str8_copy</code>. They return <code>&amp;mut T</code> from <code>&amp;self</code>, which is sound because each push returns fresh memory no one else can reach. Values pushed this way are never dropped, as in C; use <code>Box::new_in</code> when a destructor must run.</p>
+
+<h2 id="compare">4. Side by side</h2>
+<table>
+<tr><th></th><th>C (RAD)</th><th>Rust port</th></tr>
+<tr><td>Backing memory</td><td><code>mmap</code> reserve + <code>mprotect</code> commit</td><td>Same, via <code>libc</code>; <code>System</code> fallback</td></tr>
+<tr><td>Header</td><td>128 bytes at the start of each block</td><td>Same</td></tr>
+<tr><td>Chaining</td><td>Yes, unless <code>ArenaFlag_NoChain</code></td><td>Yes, unless <code>chain: false</code></td></tr>
+<tr><td>Allocate</td><td><code>push_array(arena, T, n)</code></td><td><code>Vec::new_in(&amp;arena)</code>, <code>Box::new_in(x, &amp;arena)</code>, or <code>arena.push(x)</code></td></tr>
+<tr><td>Out of memory</td><td>Aborts</td><td><code>AllocError</code> (helpers abort)</td></tr>
+<tr><td>Free</td><td>Pop / clear / release only</td><td>Same, plus freeing or growing the most recent allocation in place</td></tr>
+<tr><td>Temp scope</td><td><code>temp_begin</code> / <code>temp_end</code> by hand</td><td><code>arena.temp()</code>, ended by <code>Drop</code></td></tr>
+<tr><td>Use after pop</td><td>ASan, if enabled</td><td class="yes">Compile error</td></tr>
+<tr><td>Thread use</td><td>One thread at a time, by convention</td><td><code>Send</code> but not <code>Sync</code>: enforced</td></tr>
+<tr><td>Not ported</td><td colspan="2">Large pages, <code>ARENA_FREE_LIST</code> block reuse, the debug arena table, ASan poisoning, Telemetry plots</td></tr>
+</table>
+
+<h2 id="use">5. How to use it</h2>
+{{rs-item examples/demo.rs fn main}}
+{{output rad_arena demo}}
+<p>Inside the scope, 1,000 symbols with their names used about 57 KB; dropping the scope returned the arena to 152 bytes (the 128-byte header plus the module name and base address). Pushing 1.5 MB into 1 MB blocks chained a second block, and <code>pop_to</code> released it. The last line shows a <code>Vec</code> growing to 10,000 elements without ever moving, thanks to the in-place <code>grow</code>.</p>
+
+<h2 id="build">6. Building it yourself, step by step</h2>
+<ol class="steps">
+<li><b>Write the OS layer:</b> reserve (<code>mmap(PROT_NONE)</code> / <code>VirtualAlloc(MEM_RESERVE)</code>), commit (<code>mprotect</code> / <code>VirtualAlloc(MEM_COMMIT)</code>), release.</li>
+<li><b>Put a header at the start of each block</b> with its position, committed size, reserved size, the previous block, and its <code>base_pos</code>.</li>
+<li><b>Write push:</b> align, chain if past the reservation, commit if past the committed size, bump.</li>
+<li><b>Write <code>pop_to(&amp;mut self, pos)</code>:</b> release blocks whose <code>base_pos</code> is at or above <code>pos</code>, then set the position in the block that is left.</li>
+<li><b>Add a <code>Temp</code> guard</b> holding <code>&amp;mut Arena</code> that pops in <code>Drop</code>.</li>
+<li><b>Implement <code>Allocator</code>:</b> <code>allocate</code> calls push; override <code>grow</code> to extend the top allocation in place.</li>
+<li><b>Test</b> chaining with a small reserve, lazy commit, nested temps, an oversized push, and in-place growth. Run under Miri using the <code>System</code> fallback.</li>
+</ol>
+
+<h2 id="tests">7. Tests</h2>
+{{rs-item tests/arena.rs fn chains_new_blocks_and_releases_them_on_pop}}
+{{rs-item tests/arena.rs fn a_vec_at_the_top_grows_in_place}}
+
+<h2 id="files">8. Full source</h2>
+{{rs-file src/lib.rs}}
+{{rs-file src/os.rs}}
+{{c-file original-c/base_arena.h}}
+{{c-file original-c/base_arena.c}}
+{{c-file original-c/linux_base_memory_excerpt.c}}

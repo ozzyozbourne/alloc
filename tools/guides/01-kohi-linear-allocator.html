@@ -1,0 +1,113 @@
+<h1>Kohi linear allocator in Rust</h1>
+<p class="lede">A bump allocator over one block of memory. The C version is about 60 lines. This page shows it, the Rust port built on <code>std::alloc::Allocator</code> (stable in Rust 1.100), and how the two compare.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>A linear allocator owns one block of memory and an offset into it. Allocating returns the address at the offset and moves the offset forward by the requested size. Single allocations are never freed. Instead, <code>free_all</code> moves the offset back to 0, which frees everything in one step.</p>
+<div class="diagram"><pre>
+ block (total_size bytes)
+ ┌──────────┬──────┬────────────────┬──────────────────────────────┐
+ │  alloc 1 │ pad  │    alloc 2     │            free              │
+ └──────────┴──────┴────────────────┴──────────────────────────────┘
+ ^ memory                           ^ memory + allocated             ^ memory + total_size
+
+ allocate(n):  p = memory + allocated;  allocated += n;  return p
+ free_all():   allocated = 0
+</pre></div>
+<p>This makes allocation a few instructions with no per-allocation bookkeeping. The cost is that you must know when <em>everything</em> in the block is finished, for example at the end of a frame. Kohi uses it for per-frame and startup data.</p>
+<p>The <code>pad</code> in the diagram only exists in the Rust version. The C version never pads, which is its main problem (see section 5).</p>
+
+<h2 id="c">2. The C version</h2>
+<p>The state is four fields. <code>owns_memory</code> records whether the allocator allocated the block itself or was handed one.</p>
+{{c-item original-c/linear_allocator.h typedef struct linear_allocator {}}
+<p>Creating it either uses a block you pass in or allocates one through <code>kallocate</code>, Kohi's engine-wide allocator (folder 04).</p>
+{{c-item original-c/linear_allocator.c void linear_allocator_create (}}
+<p>Allocating checks for space, returns the current position and moves it forward. There is no <code>alignment</code> parameter.</p>
+{{c-item original-c/linear_allocator.c void *linear_allocator_allocate (}}
+<p>Freeing everything resets the offset, and optionally zeroes the whole block.</p>
+{{c-item original-c/linear_allocator.c void linear_allocator_free_all (}}
+{{c-item original-c/linear_allocator.c void linear_allocator_destroy (}}
+<p>Nothing in C stops you from calling <code>free_all</code> and then reading a pointer you got before it. The next allocation will overwrite that data.</p>
+
+<h2 id="rust">3. The Rust version</h2>
+<h3>The struct</h3>
+<p>Same fields, with two changes. <code>allocated</code> is a <code>Cell</code>, because <code>Allocator::allocate</code> takes <code>&amp;self</code>: many <code>Vec</code>s and <code>Box</code>es share one allocator through shared references, so the allocator has to change its own state through <code>&amp;self</code>. And a lifetime parameter <code>'buf</code> ties the allocator to a borrowed buffer, so the buffer cannot be freed while the allocator uses it.</p>
+{{rs-item src/lib.rs pub struct LinearAllocator<'buf>}}
+<h3>Creating it</h3>
+<p>C's single <code>create</code> with an optional <code>memory</code> pointer becomes two constructors. <code>new</code> owns its block; <code>from_buffer</code> borrows one, such as a stack array.</p>
+{{rs-item src/lib.rs impl LinearAllocator<'static>}}
+{{rs-item src/lib.rs pub fn from_buffer}}
+<h3>Implementing <code>Allocator</code></h3>
+<p>This is the whole allocator. Only two methods are required; <code>grow</code>, <code>shrink</code> and <code>allocate_zeroed</code> have default implementations built on these two.</p>
+{{rs-item src/lib.rs unsafe impl Allocator for LinearAllocator}}
+<p>Three things to notice:</p>
+<ul>
+<li><b>Alignment.</b> The start is rounded up to <code>layout.align()</code>. It rounds the <em>address</em>, not the offset, so it is right even when the buffer itself is misaligned.</li>
+<li><b>Overflow.</b> <code>checked_next_multiple_of</code> and <code>checked_add</code> return <code>None</code> on overflow, which becomes <code>AllocError</code>. The C version computes <code>allocated + size</code> without checking.</li>
+<li><b>Return type.</b> <code>NonNull&lt;[u8]&gt;</code> is a pointer plus a length. The length tells the caller how many bytes it actually got, which can be more than it asked for (the pool in folder 02 uses this).</li>
+</ul>
+<h3>Resetting it</h3>
+{{rs-item src/lib.rs pub fn free_all}}
+<p>The important part is <code>&amp;mut self</code>. Every <code>Vec&lt;T, &amp;LinearAllocator&gt;</code> holds a shared borrow of the allocator, and the compiler will not let you take <code>&amp;mut</code> while any shared borrow is alive. So you cannot reset the block while anything still points into it:</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> does not compile (doc test in src/lib.rs)</span></figcaption><pre><code>let mut frame = LinearAllocator::new(1024);
+let v: Vec&lt;u32, &amp;LinearAllocator&gt; = Vec::with_capacity_in(4, &amp;frame);
+frame.free_all(false); // error[E0502]: cannot borrow `frame` as mutable
+                       // because it is also borrowed as immutable
+drop(v);</code></pre></figure>
+<h3>Destroying it</h3>
+<p>C's <code>linear_allocator_destroy</code> becomes <code>Drop</code>, so it runs automatically and only once.</p>
+{{rs-item src/lib.rs impl Drop for LinearAllocator}}
+
+<h2 id="compare">4. Side by side</h2>
+<table>
+<tr><th></th><th>C (Kohi)</th><th>Rust port</th></tr>
+<tr><td>Allocate</td><td><code>linear_allocator_allocate(&amp;a, size)</code> returns <code>void*</code></td><td><code>Box::new_in(x, &amp;a)</code>, <code>Vec::new_in(&amp;a)</code>, or <code>a.allocate(layout)</code></td></tr>
+<tr><td>Alignment</td><td class="no">None</td><td class="yes">Always, from the type's <code>Layout</code></td></tr>
+<tr><td>Out of space</td><td>Logs an error, returns 0</td><td>Returns <code>AllocError</code>; <code>Vec::try_reserve</code> reports it, <code>Vec::push</code> aborts</td></tr>
+<tr><td>Size overflow</td><td>Unchecked</td><td>Checked</td></tr>
+<tr><td>Use after <code>free_all</code></td><td class="no">Allowed, silently reads overwritten data</td><td class="yes">Compile error</td></tr>
+<tr><td>Destroy</td><td>Manual <code>linear_allocator_destroy</code></td><td><code>Drop</code></td></tr>
+<tr><td>Borrowed buffer</td><td>Pointer; nothing checks it outlives the allocator</td><td><code>from_buffer(&amp;mut [MaybeUninit&lt;u8&gt;])</code>, checked by <code>'buf</code></td></tr>
+<tr><td>Freeing one value</td><td>Not possible</td><td><code>deallocate</code> is a no-op; dropping a <code>Box</code> runs its destructor but keeps the memory</td></tr>
+</table>
+
+<h2 id="bug">5. The alignment problem in the C version</h2>
+<div class="bug"><b>C:</b> allocations are packed back to back. Allocate 1 byte, then a <code>u64</code>, and the <code>u64</code> lands at an odd address. On x86 that is only slower; on some ARM targets, and for SIMD types, it faults or is undefined behaviour.</div>
+<p>The Rust test <code>aligns_each_allocation_unlike_the_c_version</code> checks the fix: a <code>u8</code> followed by a <code>u64</code> uses 16 bytes (1 + 7 padding + 8), and the <code>u64</code> address is a multiple of 8.</p>
+{{rs-item tests/linear.rs fn aligns_each_allocation_unlike_the_c_version}}
+
+<h2 id="use">6. How to use it</h2>
+<p>Pass <code>&amp;allocator</code> as the last argument of any <code>*_in</code> constructor. <code>&amp;A</code> is itself an <code>Allocator</code> when <code>A</code> is, so many containers can share one allocator.</p>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> per-frame allocation</span></figcaption><pre><code>let mut frame = LinearAllocator::new(64 * 1024);
+loop {
+    {
+        let mut commands: Vec&lt;DrawCommand, &amp;LinearAllocator&gt; = Vec::with_capacity_in(8, &amp;frame);
+        commands.push(...);
+        let label = Box::new_in(*b"frame", &amp;frame);
+        // ... render ...
+    } // commands and label are dropped here
+    frame.free_all(false); // allowed: nothing borrows `frame` any more
+}</code></pre></figure>
+<div class="warn"><b>Watch out for growing <code>Vec</code>s.</b> When a <code>Vec</code> outgrows its capacity, the default <code>grow</code> allocates a new buffer and copies; the old buffer is not reclaimed until <code>free_all</code>. Reserve the capacity you need up front. The RAD arena (folder 05) overrides <code>grow</code> to extend the last allocation in place.</div>
+<p>The full example, <code>examples/demo.rs</code>, runs three frames and then reuses the allocator over a stack buffer:</p>
+{{output kohi_linear demo}}
+<p>The same addresses repeat every frame because <code>free_all</code> hands the same memory out again.</p>
+
+<h2 id="build">7. Building it yourself, step by step</h2>
+<ol class="steps">
+<li><b>Pick the state.</b> A pointer to the block, its size, and a <code>Cell&lt;usize&gt;</code> offset. Use <code>Cell</code> because <code>allocate</code> only gets <code>&amp;self</code>.</li>
+<li><b>Get a block.</b> <code>Global.allocate(Layout::from_size_align(size, 16)?)</code>, and remember the layout so <code>Drop</code> can free it with exactly the same one.</li>
+<li><b>Write <code>allocate</code>.</b> Round the current address up to <code>layout.align()</code>, add <code>layout.size()</code>, check against the end, store the new offset, return <code>NonNull::slice_from_raw_parts(ptr, size)</code>. Use checked arithmetic and return <code>Err(AllocError)</code> on any failure. Never panic: the trait requires that allocator methods do not unwind.</li>
+<li><b>Write <code>deallocate</code></b> as an empty function.</li>
+<li><b>Write the <code>unsafe impl</code></b> with a <code>// SAFETY:</code> comment that explains why blocks never overlap and stay valid until they are invalidated. Implementing <code>Allocator</code> is <code>unsafe</code> because collections trust these promises.</li>
+<li><b>Make reset take <code>&amp;mut self</code>.</b> This is what turns use-after-reset into a compile error.</li>
+<li><b>Test it</b> with values of different alignments, exhaustion, and reuse after reset. Run the tests under Miri (<code>cargo +nightly miri test</code>) to catch undefined behaviour in the unsafe code.</li>
+</ol>
+
+<h2 id="tests">8. Tests</h2>
+<p><code>tests/linear.rs</code> checks alignment (including inside a deliberately misaligned buffer), exhaustion, <code>free_all</code> reusing and clearing the block, and that <code>deallocate</code> keeps memory. All pass on Rust 1.100 beta and under Miri with <code>-Zmiri-strict-provenance</code>.</p>
+{{rs-item tests/linear.rs fn aligns_addresses_even_when_the_buffer_is_misaligned}}
+
+<h2 id="files">9. Full source</h2>
+{{rs-file src/lib.rs}}
+{{c-file original-c/linear_allocator.h}}
+{{c-file original-c/linear_allocator.c}}
