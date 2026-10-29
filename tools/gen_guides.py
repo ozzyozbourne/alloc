@@ -13,6 +13,9 @@ always match the sources:
     {{c-file  original-c/file.c}}              a whole file, collapsed
     {{rs-file src/lib.rs}}                     a whole file, collapsed
     {{output  crate example}}                  stdout of `cargo run --example`
+    {{text    FILE.txt}}                       a text file, shown as output
+
+Files ending in .odin are highlighted as Odin.
 
 `start-text` is a literal substring of the item's first line. A directive that
 matches nothing stops the build.
@@ -26,7 +29,7 @@ import sys
 
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
-from pygments.lexers import CLexer, RustLexer, TextLexer
+from pygments.lexers import CLexer, OdinLexer, RustLexer, TextLexer
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "tools" / "guides"
@@ -40,6 +43,7 @@ GUIDES = [
     ("05-rad-arena", "RAD · Arena"),
     ("06-rad-scratch-arenas", "RAD · Scratch arenas"),
     ("07-rad-thread-pool-arenas", "RAD · Thread-pool arenas"),
+    ("08-verified-handle-map", "Verified handle map"),
 ]
 
 CSS = """
@@ -179,9 +183,15 @@ def expand(text, folder):
             path = base / args[0]
             lines = read(path)
             c = kind == "c-file"
-            fig = figure("c" if c else "rs", "C" if c else "Rust", lines, 1, path, folder,
-                         CLexer() if c else RustLexer())
+            odin = path.suffix == ".odin"
+            fig = figure("c" if c else "rs", "Odin" if odin else "C" if c else "Rust", lines, 1, path, folder,
+                         OdinLexer() if odin else CLexer() if c else RustLexer())
             return f'<details class="file"><summary>Show the whole file: {html.escape(args[0])} ({len(lines)} lines)</summary>{fig}</details>'
+        if kind == "text":
+            path = base / args[0]
+            return (f'<figure class="code out"><figcaption><span><span class="lang">Output</span> '
+                    f'{html.escape(args[0])}</span></figcaption>'
+                    f'<pre><code>{html.escape(path.read_text().rstrip())}</code></pre></figure>')
         if kind == "output":
             crate, example = args[0], args[1]
             out = run_example(crate, example)
@@ -190,7 +200,7 @@ def expand(text, folder):
                     f'<pre><code>{highlight(chr(10).join(out), TextLexer(), FORMATTER)}</code></pre></figure>')
         die(f"unknown directive {kind}")
 
-    return re.sub(r"\{\{(c-item|rs-item|c-lines|c-file|rs-file|output)\s+([^}]+?)\}\}", sub, text)
+    return re.sub(r"\{\{(c-item|rs-item|c-lines|c-file|rs-file|output|text)\s+([^}]+?)\}\}", sub, text)
 
 
 def page(title, body, here, prefix):

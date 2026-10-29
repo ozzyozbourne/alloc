@@ -1,0 +1,25 @@
+# cargo kani 0.68.0, CaDiCaL, capacity N = 4, run 2026-10-29 on a 4 GB orb
+
+harness                                                      result     seconds    peak_MB
+proofs::u8_gen::add_is_correct                               OK            7.58        228
+proofs::u8_gen::arbitrary_maps_cover_interesting_states      OK            4.12        222
+proofs::u8_gen::get_mut_writes_only_its_slot                 OK            3.59        223
+proofs::u8_gen::iter_yields_exactly_the_live_values          OK           11.27        438
+proofs::u8_gen::new_map_is_valid                             OK            1.58        163
+proofs::u8_gen::remove_is_correct                            OK            6.48        225
+proofs::u8_gen::removed_handle_stays_dead_after_reuse        OK            3.59        222
+proofs::u8_gen::values_are_dropped_exactly_once              OK            3.31        223
+proofs::u32_gen::add_is_correct                              OK            7.84        228
+proofs::u32_gen::arbitrary_maps_cover_interesting_states     OK            4.24        225
+proofs::u32_gen::get_mut_writes_only_its_slot                OK            4.38        223
+proofs::u32_gen::iter_yields_exactly_the_live_values         OK           17.06        460
+proofs::u32_gen::new_map_is_valid                            OK            1.50        163
+proofs::u32_gen::remove_is_correct                           OK            6.60        224
+proofs::u32_gen::removed_handle_stays_dead_after_reuse       OK            3.68        221
+proofs::u32_gen::values_are_dropped_exactly_once             OK            3.10        223
+
+# KANI_FEATURES=naive-generations (wrapping generations, like slotmap and Odin)
+
+harness                                                      result     seconds    peak_MB
+proofs::u8_gen::add_is_correct                               FAILED        5.65        228
+    Failed Checks: "add reissued an old generation"

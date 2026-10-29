@@ -8,6 +8,7 @@ members = [
     "05-rad-arena",
     "06-rad-scratch-arenas",
     "07-rad-thread-pool-arenas",
+    "08-verified-handle-map",
 ]
 
 [workspace.package]
@@ -23,6 +24,8 @@ rad_arena = { path = "05-rad-arena" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# `cfg(kani)` is set by `cargo kani` for the proof harnesses in 08.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(miri)'] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"

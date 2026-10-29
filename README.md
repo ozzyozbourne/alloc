@@ -13,6 +13,7 @@ Seven custom allocators from the [Kohi game engine](https://github.com/travisvro
 | [`05-rad-arena`](05-rad-arena) | RAD chained virtual-memory arena | `Arena: Allocator`, `Temp` |
 | [`06-rad-scratch-arenas`](06-rad-scratch-arenas) | RAD per-thread scratch arenas | `with_scratch(\|arena\| ...)` |
 | [`07-rad-thread-pool-arenas`](07-rad-thread-pool-arenas) | RAD linker per-worker arenas | `WorkerArenas` |
+| [`08-verified-handle-map`](08-verified-handle-map) | Odin `handle_map` / `slotmap`, with Kani proofs | `HandleMap<T, N, G>` |
 
 ## Running
 
@@ -21,6 +22,7 @@ rustup toolchain install beta              # rust-toolchain.toml pins beta until
 cargo test --workspace
 cargo run -p rad_arena --example demo      # every crate has examples/demo.rs
 cargo +nightly miri test --workspace       # check the unsafe code for undefined behaviour
+tools/run_kani.sh                          # Kani proofs for 08 (cargo install --locked kani-verifier)
 uv run --with pygments python tools/gen_guides.py   # regenerate the HTML guides
 ```
 
@@ -32,3 +34,5 @@ The Rust code in this repository is original. Each `original-c/` folder holds un
 
 - Kohi at commit `156b1c2c`, Apache-2.0, Copyright (c) Travis Vroman.
 - RAD Debugger at commit `771f63d`, MIT, Copyright (c) Epic Games Tools.
+- Odin at commit `69b973e`, zlib, Copyright (c) Ginger Bill.
+- slotmap 1.1.1 at commit `eccedef`, zlib, Copyright (c) Orson Peters.

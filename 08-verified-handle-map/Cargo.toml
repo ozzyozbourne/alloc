@@ -1,0 +1,18 @@
+[package]
+name = "verified_handle_map"
+version = "0.1.0"
+description = "A fixed-capacity handle map that owns its slot memory, with Kani proofs"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Use wrapping generations like slotmap and Odin, instead of retiring
+# exhausted slots. Exists so the Kani proofs can show the stale-handle bug.
+naive-generations = []
+
+[dev-dependencies]
+slotmap = "1.1"
+
+[lints]
+workspace = true

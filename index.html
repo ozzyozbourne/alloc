@@ -48,7 +48,7 @@ ol.steps > li { margin:10px 0; }
 @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } nav { position:static; height:auto; } .pair { grid-template-columns: 1fr; } main { padding:20px; } }
 </style></head>
 <body><div class="layout">
-<nav><h2>Guides</h2><a href="index.html" class="here">Overview</a><a href="01-kohi-linear-allocator/guide.html" class="">Kohi · Linear allocator</a><a href="02-kohi-pool-allocator/guide.html" class="">Kohi · Pool allocator</a><a href="03-kohi-freelist/guide.html" class="">Kohi · Freelist</a><a href="04-kohi-dynamic-allocator/guide.html" class="">Kohi · Dynamic allocator</a><a href="05-rad-arena/guide.html" class="">RAD · Arena</a><a href="06-rad-scratch-arenas/guide.html" class="">RAD · Scratch arenas</a><a href="07-rad-thread-pool-arenas/guide.html" class="">RAD · Thread-pool arenas</a><h2>On this page</h2><div class="toc"><a href="#guides">1. The guides</a><a href="#trait">2. The trait in one minute</a><a href="#stable">3. What is stable in 1.100</a><a href="#compare">4. All seven at a glance</a><a href="#run">5. Running it</a><a href="#sources">6. Sources and licences</a></div></nav>
+<nav><h2>Guides</h2><a href="index.html" class="here">Overview</a><a href="01-kohi-linear-allocator/guide.html" class="">Kohi · Linear allocator</a><a href="02-kohi-pool-allocator/guide.html" class="">Kohi · Pool allocator</a><a href="03-kohi-freelist/guide.html" class="">Kohi · Freelist</a><a href="04-kohi-dynamic-allocator/guide.html" class="">Kohi · Dynamic allocator</a><a href="05-rad-arena/guide.html" class="">RAD · Arena</a><a href="06-rad-scratch-arenas/guide.html" class="">RAD · Scratch arenas</a><a href="07-rad-thread-pool-arenas/guide.html" class="">RAD · Thread-pool arenas</a><a href="08-verified-handle-map/guide.html" class="">Verified handle map</a><h2>On this page</h2><div class="toc"><a href="#guides">1. The guides</a><a href="#trait">2. The trait in one minute</a><a href="#stable">3. What is stable in 1.100</a><a href="#compare">4. All seven at a glance</a><a href="#run">5. Running it</a><a href="#sources">6. Sources and licences</a></div></nav>
 <main><h1>C allocators in Rust</h1>
 <p class="lede">Seven custom allocators from the <a href="https://github.com/travisvroman/kohi">Kohi game engine</a> and the <a href="https://github.com/EpicGamesExt/raddebugger">RAD Debugger</a>, rebuilt on Rust's <code>std::alloc::Allocator</code> trait (stable from Rust 1.100). Each folder has the Rust crate, the original C it copies, tests, a runnable example, and a guide comparing the two.</p>
 
@@ -62,8 +62,9 @@ ol.steps > li { margin:10px 0; }
 <tr><td><a href="05-rad-arena/guide.html">05-rad-arena</a></td><td>RAD <code>base_arena.c</code></td><td>Chained virtual-memory arena with temp scopes</td><td><code>Arena</code>: <code>Allocator</code>, <code>Temp</code></td></tr>
 <tr><td><a href="06-rad-scratch-arenas/guide.html">06-rad-scratch-arenas</a></td><td>RAD <code>base_thread_context.c</code></td><td>Per-thread scratch arenas</td><td><code>with_scratch(|arena| ...)</code></td></tr>
 <tr><td><a href="07-rad-thread-pool-arenas/guide.html">07-rad-thread-pool-arenas</a></td><td>RAD linker <code>thread_pool.c</code></td><td>One arena per worker thread</td><td><code>WorkerArenas</code></td></tr>
+<tr><td><a href="08-verified-handle-map/guide.html">08-verified-handle-map</a></td><td>Odin <code>handle_map</code>, <code>slotmap</code></td><td>Handle map that owns its slots, proved with Kani</td><td><code>HandleMap&lt;T, N, G&gt;</code></td></tr>
 </table>
-<p>Read them in order: 01 introduces the trait, 03 is the base of 04, and 05 is the base of 06 and 07.</p>
+<p>Read them in order: 01 introduces the trait, 03 is the base of 04, and 05 is the base of 06 and 07. 08 is a different kind of allocator, one built into a data structure, and adds formal verification.</p>
 
 <h2 id="trait">2. The trait in one minute</h2>
 <p>Everything in this repository implements, or is built on, this trait. Only two methods are required:</p>
@@ -114,10 +115,11 @@ ol.steps > li { margin:10px 0; }
 cargo test --workspace                   # unit, model and compile-fail tests
 cargo run -p rad_arena --example demo    # each crate has examples/demo.rs
 cargo +nightly miri test --workspace     # check the unsafe code for UB
+tools/run_kani.sh                        # Kani proofs for 08
 uv run --with pygments python tools/gen_guides.py   # rebuild these pages</code></pre></figure>
 <p>The guide pages are generated: every code excerpt is pulled from the real source files, and every "Output" box is the actual output of the example, so they cannot drift from the code.</p>
 
 <h2 id="sources">6. Sources and licences</h2>
-<p>The <code>original-c/</code> folders contain unmodified copies (line endings normalised) of Kohi at commit <code>156b1c2c</code> (Apache-2.0, Copyright Travis Vroman) and the RAD Debugger at commit <code>771f63d</code> (MIT, Copyright Epic Games Tools), each with its licence file.</p>
+<p>The <code>original-c/</code> folders contain unmodified copies (line endings normalised) of Kohi at commit <code>156b1c2c</code> (Apache-2.0, Copyright Travis Vroman) the RAD Debugger at commit <code>771f63d</code> (MIT, Copyright Epic Games Tools), Odin at <code>69b973e</code> (zlib, Copyright Ginger Bill) and slotmap 1.1.1 at <code>eccedef</code> (zlib, Copyright Orson Peters), each with its licence file.</p>
 </main>
 </div></body></html>

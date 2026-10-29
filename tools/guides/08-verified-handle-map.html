@@ -1,0 +1,147 @@
+<h1>A verified handle map in Rust</h1>
+<p class="lede">A handle map that is its own allocator: it owns a fixed array of slots and decides which are in use. Because it is small and fixed in size, Kani can prove it correct for every reachable state at capacity 4. This page compares it with Odin's <code>core:container/handle_map</code> and the <code>slotmap</code> crate, and shows exactly what the proofs cover and what they don't.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>A handle map stores values in slots and hands out <b>handles</b>: a slot index plus a <b>generation</b>. Removing a value changes the slot's generation, so every old handle to it stops resolving, even after the slot is reused for something else. Games use this for entity references: system A can remove an enemy and spawn a pickup in the same slot, and system B's stale handle to the enemy just returns <code>None</code>, instead of silently pointing at the pickup.</p>
+<div class="diagram"><pre>
+ slots:       0           1           2           3
+ occupied:   yes          no         yes          no
+ generation:  1           2           1           0
+ value:     player       ---        camera       ---
+ free list:  head → 1 → 3 → end
+
+ add(pickup):  take slot 1, generation 2 → 3, return Handle { idx: 1, generation: 3 }
+ get(Handle { idx: 1, generation: 2 }):  slot 1 has generation 3 → None   (stale)
+</pre></div>
+<p>The map manages its own slot memory with <code>MaybeUninit&lt;T&gt;</code>. That is the <code>unsafe</code> part, and it is what the proofs are mostly about: a slot must be read only when it holds a value, moved out exactly once, and dropped exactly once.</p>
+
+<h2 id="others">2. The two implementations it is compared with</h2>
+<h3>Odin: <code>Static_Handle_Map</code></h3>
+<p>Odin's standard library now ships a handle map. The static version keeps a fixed <code>[N]T</code> inline, a parallel array of free-list links, and requires <code>T</code> to have a <code>handle</code> field. Slot 0 is a dummy so that a zero handle means "none".</p>
+{{c-file original/static_handle_map.odin}}
+<p>Its <code>add</code> bumps the generation with <code>prev_gen + 1</code>, which wraps when the counter is full:</p>
+<figure class="code c"><figcaption><span><span class="lang">Odin</span> original/static_handle_map.odin (excerpt of static_add)</span></figcaption><pre><code>prev_gen := ptr.handle.gen
+ptr^ = item
+ptr.handle.idx = auto_cast i
+ptr.handle.gen = auto_cast (prev_gen + 1)</code></pre></figure>
+<h3>Rust: <code>slotmap::SlotMap</code></h3>
+<p>slotmap stores <code>Vec&lt;Slot&lt;T&gt;&gt;</code>, where each slot is a <code>union</code> of the value and the next free index, plus a <code>u32</code> version. An odd version means occupied, even means vacant, so occupancy costs no extra memory. Removing does <code>version.wrapping_add(1)</code>.</p>
+{{rs-item original/slotmap_basic.rs union SlotUnion<T>}}
+{{rs-item original/slotmap_basic.rs unsafe fn remove_from_slot}}
+
+<h2 id="rust">3. This implementation</h2>
+<h3>Layout</h3>
+{{rs-item src/lib.rs pub struct HandleMap<T, const N: usize, G: Generation = u32>}}
+<p>Parallel arrays like Odin, <code>MaybeUninit&lt;T&gt;</code> like slotmap's <code>ManuallyDrop</code>. Two choices differ from both:</p>
+<ul>
+<li><b>A separate <code>occupied</code> flag.</b> slotmap's odd/even trick saves a byte per slot, but it makes the generation do two jobs. Keeping them apart lets every generation only ever increase, which is a property the proofs check.</li>
+<li><b>Generations never wrap.</b> A slot whose generation reaches <code>G::MAX</code> is retired: emptied and never put back on the free list. Odin and slotmap wrap instead (section 5).</li>
+</ul>
+<h3>The generation type</h3>
+<p>The generation is a type parameter, so the same code can be checked with <code>u8</code>, where the retirement path is reached after 255 reuses, and used with <code>u32</code> or <code>u64</code> in practice.</p>
+{{rs-item src/lib.rs pub trait Generation}}
+<h3>Operations</h3>
+{{rs-item src/lib.rs pub fn add(}}
+{{rs-item src/lib.rs pub fn remove(}}
+{{rs-item src/lib.rs pub fn get(}}
+<h3>The invariant</h3>
+<p>Everything the proofs rely on is written down in one function. It never reads values, only bookkeeping:</p>
+{{rs-item src/lib.rs pub fn check_invariant}}
+
+<h2 id="proofs">4. The proofs</h2>
+<h3>How they avoid running out of memory</h3>
+<p>The first attempt in this project simulated random sequences of operations from an empty map. Each extra step multiplies the work for the solver, and 4 steps on 3 slots already used more than 3 GB. The fix is <b>induction</b>:</p>
+<ol>
+<li><b>Base case:</b> <code>new()</code> satisfies <code>check_invariant</code> (<code>new_map_is_valid</code>).</li>
+<li><b>Step:</b> start from an <em>arbitrary</em> map that satisfies the invariant, any occupancy, generations, free list and values, run <em>one</em> operation with arbitrary arguments, and check that the invariant still holds and the result is right.</li>
+</ol>
+<p>Since every operation keeps the invariant, it holds after any number of operations, and the per-operation checks hold in every reachable state. The bound is the capacity (<code>N = 4</code>), not the number of steps. Kani also checks every <code>unsafe</code> block on every path: no read of an empty slot, no out-of-bounds index, no overflow.</p>
+{{rs-item src/proofs.rs fn any_valid}}
+<h3>What each harness proves</h3>
+<table>
+<tr><th>Harness</th><th>Proves, for every map satisfying the invariant (N = 4)</th></tr>
+<tr><td><code>new_map_is_valid</code></td><td>A new map is empty, valid, and no handle resolves.</td></tr>
+<tr><td><code>add_is_correct</code></td><td>The invariant is kept; the slot was free; the new generation is higher than the slot's old one, so the handle never existed before; <code>get</code> returns the value; no other handle changes; <code>add</code> fails only when every slot is used or retired, and then returns the value.</td></tr>
+<tr><td><code>remove_is_correct</code></td><td>The invariant is kept; it returns exactly what <code>get</code> returned; the handle is dead afterwards; no other handle and no generation changes.</td></tr>
+<tr><td><code>removed_handle_stays_dead_after_reuse</code></td><td>Remove, then add again: the old handle still does not resolve.</td></tr>
+<tr><td><code>get_mut_writes_only_its_slot</code></td><td>Writing through <code>get_mut</code> changes only that handle's value.</td></tr>
+<tr><td><code>iter_yields_exactly_the_live_values</code></td><td><code>iter</code> yields <code>len</code> items, each under a handle that resolves to it.</td></tr>
+<tr><td><code>values_are_dropped_exactly_once</code></td><td>Remove one value and drop the map: exactly <code>len</code> drops happen.</td></tr>
+<tr><td><code>arbitrary_maps_cover_interesting_states</code></td><td>Not a property: a guard against vacuous proofs. Six <code>kani::cover!</code> checks confirm the arbitrary maps include empty, full, retired-slot, mid-list and near-retirement states.</td></tr>
+</table>
+<p>Each harness runs twice, with <code>u8</code> and <code>u32</code> generations.</p>
+{{rs-item src/proofs.rs fn add_is_correct}}
+
+<h3>Results</h3>
+<p>From <code>tools/run_kani.sh</code>, which runs one harness at a time and kills a proof if available memory drops below 800 MB:</p>
+{{text KANI_RESULTS.txt}}
+<p>Every harness finishes in under 20 seconds and under 500 MB.</p>
+
+<h3>Do the proofs catch bugs?</h3>
+<p>A proof that passes no matter what the code does is worthless. To check, each of these bugs was put into <code>src/lib.rs</code> by hand and the relevant harness rerun. Every one was caught:</p>
+<table>
+<tr><th>Bug introduced</th><th>Harness</th><th>Kani reported</th></tr>
+<tr><td><code>remove</code> doesn't push the slot onto the free list</td><td><code>remove_is_correct</code></td><td class="no"><code>m.check_invariant()</code> failed</td></tr>
+<tr><td><code>remove</code> leaves the slot marked occupied</td><td><code>remove_is_correct</code></td><td class="no"><code>m.get(h).is_none()</code> failed</td></tr>
+<tr><td><code>add</code> doesn't bump the generation</td><td><code>add_is_correct</code></td><td class="no">"add reissued an old generation"</td></tr>
+<tr><td><code>get</code> ignores the generation</td><td><code>removed_handle_stays_dead_after_reuse</code></td><td class="no"><code>!m.contains(h)</code> failed</td></tr>
+<tr><td><code>Drop</code> leaks values</td><td><code>values_are_dropped_exactly_once</code></td><td class="no">drop count ≠ <code>len</code></td></tr>
+</table>
+
+<h2 id="wrap">5. The wraparound bug in Odin and slotmap</h2>
+<p>Both increment a slot's generation with a wrapping add. After enough reuses of one slot, the counter comes back to a value an old handle still holds, and that stale handle resolves again, to whatever now lives in the slot.</p>
+<ul>
+<li><b>slotmap</b> uses a 32-bit version that advances by 2 per reuse, so one slot must be reused about 2.1 billion times. Rare, but a hot slot in a long-running server can get there.</li>
+<li><b>Odin</b> lets you pick the handle type. With its <code>Handle16</code> (<code>u8</code> generation), one slot reused 256 times revives every handle from its first use. With <code>Handle32</code> it is 65,536 reuses: about 18 minutes of reusing one slot every frame at 60 fps.</li>
+</ul>
+<p>The <code>naive-generations</code> feature switches this crate to the wrapping behaviour. Kani then finds the bug in <code>add_is_correct</code> ("add reissued an old generation", in the results above). With <code>u8</code> generations a wrap can also give an occupied slot generation 0, which breaks the invariant, and the model test fails at step 8,004. Retiring the slot instead costs one slot per 255 (or 4 billion) reuses of it.</p>
+{{rs-item tests/handle_map.rs fn exhausted_slots_are_retired_not_wrapped}}
+
+<h2 id="tests">6. Tests beside the proofs</h2>
+<p>The proofs cover capacity 4. Ordinary tests cover larger maps and long runs:</p>
+<ul>
+<li><b>Model test:</b> 20,000 random operations on 16 slots with <code>u8</code> generations, compared after every step with a <code>HashMap&lt;Handle, T&gt;</code>, with stale handles checked and the invariant asserted. Slots do retire during the run.</li>
+<li><b>Differential test:</b> the same 10,000 operations on this map and on <code>slotmap::SlotMap</code>; values and liveness of every handle, live or stale, must agree.</li>
+<li><b>Miri</b> runs all the tests (with smaller counts) and finds no undefined behaviour.</li>
+</ul>
+{{rs-item tests/handle_map.rs fn behaves_like_slotmap}}
+
+<h2 id="compare">7. Side by side</h2>
+<table>
+<tr><th></th><th>Odin <code>Static_Handle_Map</code></th><th><code>slotmap::SlotMap</code></th><th>This crate</th></tr>
+<tr><td>Storage</td><td>Inline <code>[N]T</code></td><td>Growing <code>Vec</code></td><td>Inline <code>[MaybeUninit&lt;T&gt;; N]</code></td></tr>
+<tr><td>Capacity</td><td>N − 1 (slot 0 is the dummy)</td><td>Unbounded</td><td>N</td></tr>
+<tr><td>"No handle"</td><td>Index 0</td><td><code>KeyData::null()</code></td><td>Generation 0</td></tr>
+<tr><td>Occupancy</td><td><code>handle.idx == 0</code> means empty</td><td>Odd/even version</td><td>Separate <code>bool</code></td></tr>
+<tr><td>Generation overflow</td><td class="no">Wraps</td><td class="no">Wraps</td><td class="yes">Slot retired</td></tr>
+<tr><td>Generation size</td><td>Chosen by handle type</td><td><code>u32</code></td><td>Type parameter</td></tr>
+<tr><td>Requires a field in <code>T</code></td><td>Yes, <code>handle</code></td><td>No</td><td>No</td></tr>
+<tr><td>Full map</td><td>Returns <code>ok = false</code></td><td>Grows</td><td>Returns <code>Err(value)</code></td></tr>
+<tr><td>Holding a reference across <code>add</code></td><td>Allowed; pointers are stable</td><td>Compile error</td><td>Compile error</td></tr>
+<tr><td>Checked by</td><td>Tests</td><td>Tests, fuzzing</td><td>Kani proofs (N = 4), Miri, model and differential tests</td></tr>
+</table>
+
+<h2 id="limits">8. What is not proved</h2>
+<ul>
+<li><b>Capacities above 4.</b> The code has no size-dependent branches, so a bug that needs more slots is unlikely, but it is not excluded. The model test covers 16; a proof for any N needs Verus or Creusot.</li>
+<li><b>Values are <code>u8</code></b> in most harnesses (<code>Counted</code> in the drop one). Value type doesn't affect the bookkeeping, and the map never inspects values.</li>
+<li><b>Panics in <code>T</code>'s destructor</b> during <code>Drop</code> are not modelled.</li>
+<li><b><code>clear</code></b> is built from <code>iter</code> and <code>remove</code>, which are proved, but it has no harness of its own.</li>
+<li>The proofs check this Rust code with Kani's model of Rust semantics. They say nothing about the compiler or hardware.</li>
+</ul>
+
+<h2 id="use">9. How to use it</h2>
+{{rs-item examples/demo.rs fn main}}
+{{output verified_handle_map demo}}
+
+<h2 id="run">10. Running the proofs</h2>
+<figure class="code out"><figcaption><span><span class="lang">Shell</span> from the repository root</span></figcaption><pre><code>cargo install --locked kani-verifier &amp;&amp; cargo kani setup
+tools/run_kani.sh                                    # all harnesses, one at a time
+tools/run_kani.sh remove_is_correct                  # just some
+KANI_FEATURES=naive-generations tools/run_kani.sh    # watch the wraparound bug get caught
+cargo test -p verified_handle_map
+cargo +nightly miri test -p verified_handle_map</code></pre></figure>
+
+<h2 id="files">11. Full source</h2>
+{{rs-file src/lib.rs}}
+{{rs-file src/proofs.rs}}
