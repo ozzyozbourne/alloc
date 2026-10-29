@@ -1,0 +1,91 @@
+<h1>A handle map proved with Verus</h1>
+<p class="lede">The handle map from <a href="../08-verified-handle-map/guide.html">08</a>, proved correct for <b>every capacity</b> and <b>every allocator</b> with <a href="https://github.com/verus-lang/verus">Verus</a>. Kani explored every state of a 4-slot map. Verus instead checks a written proof, so the size of the map does not matter. This page shows how the proof is built, what it proves, and how it compares with the Kani approach.</p>
+
+<h2 id="why">1. Why a second proof</h2>
+<p>Kani is a <b>model checker</b>: it turns the code into one large logic formula and lets a SAT solver search every possible input. That needs no proof writing, but the formula grows with the data, so 08 had to fix the capacity at 4. A bug that needs 5 slots would not be found.</p>
+<p>Verus is a <b>deductive verifier</b>. You write the specification next to the code: <code>requires</code> (preconditions), <code>ensures</code> (postconditions), loop invariants, and a <code>spec fn</code> that says what a well-formed map is. Verus then asks the Z3 SMT solver to check each function on its own, against those specs. Nothing is unrolled, so a map with a million slots is covered by the same proof as one with four.</p>
+<table>
+<tr><th></th><th>Kani (08)</th><th>Verus (09)</th></tr>
+<tr><td>Bound</td><td>Capacity 4</td><td class="yes">None</td></tr>
+<tr><td>What you write</td><td>Harnesses: ordinary Rust with <code>kani::any()</code> and asserts</td><td>Specs, a ghost model, and proof hints inside <code>verus! { }</code></td></tr>
+<tr><td>Code it can check</td><td>Any Rust, including <code>unsafe</code> and <code>MaybeUninit</code></td><td>Rust in Verus's subset; <code>unsafe</code> needs Verus's own permission types</td></tr>
+<tr><td>Toolchain</td><td><code>cargo kani</code> on the normal crate</td><td>Its own <code>verus</code> binary (Rust 1.99), separate from the workspace</td></tr>
+<tr><td>Cost here</td><td>16 harnesses, ~5–17 s and 160–460 MB each</td><td>All 16 functions in ~3 s and ~320 MB</td></tr>
+<tr><td>Effort</td><td>Low</td><td>High: about 600 lines, most of them proof</td></tr>
+</table>
+<p>So the two complement each other: 08 keeps the <code>unsafe</code> version checked by Kani and Miri, and 09 proves the bookkeeping for any size.</p>
+
+<h2 id="layout">2. The data structure</h2>
+<p>The design is 08's: index-plus-generation handles, generations that only increase, slots retired at <code>MAX_GEN</code> instead of wrapping, and an intrusive free list through <code>next_free</code>. Three things changed so Verus can reason about it:</p>
+<ul>
+<li>Slots are a <code>Vec&lt;Slot&lt;T&gt;, A&gt;</code> from any <code>A: Allocator</code>, created with <code>Vec::with_capacity_in</code>, instead of an inline array. The capacity is a run-time value.</li>
+<li>A slot's value is an <code>Option&lt;T&gt;</code>, so occupancy is <code>value.is_some()</code> rather than <code>MaybeUninit&lt;T&gt;</code> plus a flag. All code is safe Rust.</li>
+<li>The generation is a fixed <code>u32</code>.</li>
+</ul>
+{{rs-item src/handle_map.rs pub struct Slot<T>}}
+{{rs-item src/handle_map.rs pub struct HandleMap<T, A: Allocator>}}
+<p>The four <code>Ghost</code> fields exist only for the proof and are erased when compiling. <code>free_list</code> is the free list as a mathematical sequence; <code>issued</code> and <code>dead</code> record every handle ever returned by <code>add</code> or removed by <code>remove</code>. With them, "a removed handle never comes back" becomes a statement about a set, which the solver can check.</p>
+
+<h2 id="spec">3. The specification</h2>
+<h3>What callers see</h3>
+<p>Callers reason with a few <code>spec fn</code>s, never with the fields. <code>closed</code> hides the body outside the module, so a client's proof depends only on these names and the operations' <code>ensures</code>:</p>
+{{rs-item src/handle_map.rs pub open spec fn live(}}
+{{rs-item src/handle_map.rs pub open spec fn is_reusable(}}
+<h3>The invariant</h3>
+<p><code>wf</code> plays the role of 08's <code>check_invariant</code>, but it is logic, not code, so it can say "for all slots" with no loop. It is split in three, each marked <code>#[verifier::opaque]</code>:</p>
+{{rs-item src/handle_map.rs pub closed spec fn wf(}}
+{{rs-item src/handle_map.rs closed spec fn wf_free(}}
+{{rs-item src/handle_map.rs closed spec fn wf_count(}}
+{{rs-item src/handle_map.rs closed spec fn wf_handles(}}
+<p>The key part is the last clause of <code>wf_free</code>: each slot on the ghost list links, through its runtime <code>next_free</code>, to the next one, and the last links to <code>NONE</code>. Together with <code>no_duplicates</code>, that means following the real pointers from <code>free_head</code> visits exactly the ghost sequence and stops. No cycle is possible.</p>
+<div class="note">The first version had one big <code>wf</code>. Z3 hit its resource limit on <code>add</code> and <code>remove</code>, because every quantifier in the invariant was visible in every step of the proof. Making the parts opaque and <code>reveal</code>ing only the one each step needs brought the whole file down to about 3 seconds.</div>
+
+<h2 id="ops">4. Operations and their contracts</h2>
+<h3><code>add</code></h3>
+<p>The <code>ensures</code> clause is the contract: on success the handle resolves to the value, was never issued before, and no other handle changed; on failure every slot is occupied or retired and the map is untouched.</p>
+{{rs-item src/handle_map.rs pub fn add(}}
+<p>The executable part is eight lines: pop <code>free_head</code>, bump the generation, store the value. Everything inside <code>proof { }</code> is hints for the solver. Most say which list element moved where (<code>nfl[k] == fl[k + 1]</code>), so the solver can match the old free list to the new one.</p>
+<p>Overflow is proved, not assumed: <code>generation + 1</code> is safe because the slot is on the free list, so it is reusable, so its generation is below <code>MAX_GEN</code>. Change it to <code>wrapping_add</code> and drop the retirement check (what slotmap and Odin do) and Verus rejects the code (section 6).</p>
+<h3><code>remove</code></h3>
+{{rs-item src/handle_map.rs pub fn remove(}}
+<p>If the slot's generation is <code>MAX_GEN</code>, it is not pushed back: the slot is retired. The ghost list follows the same branch, so <code>wf_free</code> holds either way.</p>
+<h3><code>get</code> and <code>new_in</code></h3>
+{{rs-item src/handle_map.rs pub fn get(}}
+{{rs-item src/handle_map.rs pub fn new_in(}}
+<p><code>new_in</code> needs a loop invariant: after <code>i</code> pushes, slots <code>0..i</code> are empty, have generation 0 and link to <code>j + 1</code> (or <code>NONE</code> for the last). That is what makes the free list correct for any capacity.</p>
+
+<h2 id="clients">5. Using the proof from client code</h2>
+<p>The point of the specs is that callers can prove things too. In <code>main.rs</code>, Verus checks these functions for every allocator and every input, using only the contracts above:</p>
+{{rs-item src/main.rs fn stale_handle_demo<A: Allocator>}}
+{{rs-item src/main.rs fn churn<A: Allocator>}}
+<p><code>churn</code> is the "any number of operations" result in four lines: the loop invariant only needs <code>wf</code> and "the stale handle is in <code>dead</code>", and the lemma turns that into "it is not live".</p>
+{{rs-item src/handle_map.rs pub proof fn lemma_dead_never_live}}
+<p>The map is a normal Rust type at run time. <code>main</code> runs it with a custom allocator that counts bytes:</p>
+{{rs-item src/main.rs fn main()}}
+
+<h2 id="results">6. Results</h2>
+<p>From <code>tools/run_verus.sh</code> (memory watchdog included), the compiled demo, and <code>tools/verus_mutants.py</code>, which plants one bug at a time in a copy of the source and reruns Verus:</p>
+{{text VERUS_RESULTS.txt}}
+<p>All nine bugs are rejected, including the generation wrapping slotmap and Odin use. A proof that passed on buggy code would be useless, so this table is as important as the "0 errors" line.</p>
+
+<h2 id="limits">7. What is not proved</h2>
+<ul>
+<li><b>The <code>unsafe</code> version.</b> This map uses <code>Option&lt;T&gt;</code>. 08's <code>MaybeUninit&lt;T&gt;</code> code is checked by Kani (capacity 4) and Miri, not by Verus. Proving it would mean Verus's <code>PointsTo</code> permission types instead of plain fields.</li>
+<li><b>The allocator itself.</b> <code>A</code> is trusted to behave as the <code>Allocator</code> trait promises. vstd's spec for <code>Vec::with_capacity_in</code> and <code>push</code> is assumed, not proved.</li>
+<li><b>Trusted base.</b> Verus, Z3, vstd's specs of <code>Vec</code> and <code>Option</code>, and rustc.</li>
+<li><b>Fewer operations than 08.</b> No <code>get_mut</code>, <code>iter</code>, <code>clear</code> or generic generation type; adding them is more of the same proof work.</li>
+<li><b>Panics on allocation failure.</b> <code>new_in</code> calls <code>Vec::with_capacity_in</code>, which aborts if the allocator fails; that is outside the spec.</li>
+</ul>
+
+<h2 id="run">8. Running it</h2>
+<figure class="code out"><figcaption><span><span class="lang">Shell</span> from the repository root</span></figcaption><pre><code># Verus release 0.2026.10.26.d17fbd0, plus: rustup toolchain install 1.99.1
+VERUS=/path/to/verus tools/run_verus.sh                          # 16 verified, 0 errors
+VERUS=/path/to/verus tools/run_verus.sh --compile -o /tmp/demo &amp;&amp; /tmp/demo
+VERUS=/path/to/verus python3 tools/verus_mutants.py              # every planted bug caught
+# If the bundled z3 needs a newer glibc: pip download z3-solver==4.16.0.0,
+# unzip, and set VERUS_Z3_PATH to z3_solver-4.16.0.0.data/data/bin/z3</code></pre></figure>
+<p>This folder is not in the Cargo workspace, because Verus brings its own compiler (Rust 1.99, so <code>#![feature(allocator_api)]</code> is still needed there).</p>
+
+<h2 id="files">9. Full source</h2>
+{{rs-file src/handle_map.rs}}
+{{rs-file src/main.rs}}

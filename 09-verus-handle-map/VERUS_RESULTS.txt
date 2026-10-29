@@ -1,0 +1,27 @@
+# Verus 0.2026.10.26.d17fbd0 (Rust 1.99.1), Z3 4.16.0, run 2026-10-29 on a 4 GB orb
+
+$ tools/run_verus.sh
+verification results:: 16 verified, 0 errors
+time: 3.22 s, peak memory: 322 MB
+
+# Demo: tools/run_verus.sh --compile -o /tmp/demo && /tmp/demo
+old handle Handle { idx: 0, generation: 1 }, new handle Handle { idx: 0, generation: 2 }
+1000 slots: 32000 bytes from the counting allocator
+get(h) = Some("hello")
+remove(h) = Some("hello")
+after reuse: get(h) = None, get(h2) = Some("again"), len = 1
+capacity = 1000
+after drop: 0 bytes live
+
+# Planted bugs: python3 tools/verus_mutants.py  (line numbers are in the mutated copy)
+
+planted bug                                             caught verus
+wrap generations like slotmap/Odin                      yes    15 verified, 1 errors  (assertion failed, handle_map.rs:576)
+put retired slots back on the free list                 yes    15 verified, 1 errors  (assertion failed, handle_map.rs:576)
+add does not bump the generation                        yes    15 verified, 1 errors  (postcondition not satisfied, handle_map.rs:323)
+add does not advance free_head                          yes    15 verified, 1 errors  (assertion failed, handle_map.rs:392)
+remove leaks the slot (not pushed on the free list)     yes    15 verified, 1 errors  (assertion failed, handle_map.rs:533)
+remove does not decrement len                           yes    15 verified, 1 errors  (postcondition not satisfied, handle_map.rs:482)
+get ignores the generation                              yes    14 verified, 2 errors  (postcondition not satisfied, handle_map.rs:299)
+contains ignores occupancy                              yes    14 verified, 2 errors  (postcondition not satisfied, handle_map.rs:287)
+new_in builds a cyclic free list                        yes    13 verified, 3 errors  (invariant not satisfied at end of loop body, handle_map.rs:214)

@@ -44,6 +44,7 @@ GUIDES = [
     ("06-rad-scratch-arenas", "RAD · Scratch arenas"),
     ("07-rad-thread-pool-arenas", "RAD · Thread-pool arenas"),
     ("08-verified-handle-map", "Verified handle map"),
+    ("09-verus-handle-map", "Verus handle map"),
 ]
 
 CSS = """

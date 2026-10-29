@@ -14,6 +14,7 @@ Seven custom allocators from the [Kohi game engine](https://github.com/travisvro
 | [`06-rad-scratch-arenas`](06-rad-scratch-arenas) | RAD per-thread scratch arenas | `with_scratch(\|arena\| ...)` |
 | [`07-rad-thread-pool-arenas`](07-rad-thread-pool-arenas) | RAD linker per-worker arenas | `WorkerArenas` |
 | [`08-verified-handle-map`](08-verified-handle-map) | Odin `handle_map` / `slotmap`, with Kani proofs | `HandleMap<T, N, G>` |
+| [`09-verus-handle-map`](09-verus-handle-map) | 08's handle map, with Verus proofs for any capacity | `HandleMap<T, A>` |
 
 ## Running
 
@@ -23,10 +24,11 @@ cargo test --workspace
 cargo run -p rad_arena --example demo      # every crate has examples/demo.rs
 cargo +nightly miri test --workspace       # check the unsafe code for undefined behaviour
 tools/run_kani.sh                          # Kani proofs for 08 (cargo install --locked kani-verifier)
+VERUS=/path/to/verus tools/run_verus.sh    # Verus proof for 09 (see 09-verus-handle-map/README.md)
 uv run --with pygments python tools/gen_guides.py   # regenerate the HTML guides
 ```
 
-No `#![feature]` is used anywhere. Once 1.100.0 is on stable, change `rust-toolchain.toml` to `stable`.
+No `#![feature]` is used in the workspace crates. 09 is built by Verus on Rust 1.99, so it still needs `#![feature(allocator_api)]`. Once 1.100.0 is on stable, change `rust-toolchain.toml` to `stable`.
 
 ## Sources and licences
 

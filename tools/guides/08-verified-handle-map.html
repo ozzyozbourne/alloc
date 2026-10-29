@@ -123,7 +123,7 @@ ptr.handle.gen = auto_cast (prev_gen + 1)</code></pre></figure>
 
 <h2 id="limits">8. What is not proved</h2>
 <ul>
-<li><b>Capacities above 4.</b> The code has no size-dependent branches, so a bug that needs more slots is unlikely, but it is not excluded. The model test covers 16; a proof for any N needs Verus or Creusot.</li>
+<li><b>Capacities above 4.</b> The code has no size-dependent branches, so a bug that needs more slots is unlikely, but it is not excluded. The model test covers 16. <a href="../09-verus-handle-map/guide.html">09</a> proves the bookkeeping for any capacity with Verus.</li>
 <li><b>Values are <code>u8</code></b> in most harnesses (<code>Counted</code> in the drop one). Value type doesn't affect the bookkeeping, and the map never inspects values.</li>
 <li><b>Panics in <code>T</code>'s destructor</b> during <code>Drop</code> are not modelled.</li>
 <li><b><code>clear</code></b> is built from <code>iter</code> and <code>remove</code>, which are proved, but it has no harness of its own.</li>
