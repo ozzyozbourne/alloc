@@ -121,17 +121,12 @@ fn matches_a_byte_map_under_random_operations() {
         }
 
         let mut expected = Vec::new();
-        let mut i = 0;
-        while i < SIZE {
-            if !used[i] {
-                let start = i;
-                while i < SIZE && !used[i] {
-                    i += 1;
-                }
-                expected.push((start as u64, (i - start) as u64));
-            } else {
-                i += 1;
+        let mut offset = 0;
+        for run in used.chunk_by(|a, b| a == b) {
+            if !run[0] {
+                expected.push((offset as u64, run.len() as u64));
             }
+            offset += run.len();
         }
         assert_eq!(ranges(&list), expected, "step {step}");
     }

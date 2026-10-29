@@ -122,22 +122,13 @@ impl<S: AsRef<[Node]> + AsMut<[Node]>> FreeList<S> {
         let slice = nodes.as_mut();
         assert!(!slice.is_empty(), "a freelist needs at least one node");
         assert!(slice.len() < NONE as usize, "too many freelist nodes");
-        slice.fill(Node::EMPTY);
-        let head = if total_size > 0 {
-            slice[0] = Node {
-                offset: 0,
-                size: total_size,
-                next: NONE,
-            };
-            0
-        } else {
-            NONE
-        };
-        FreeList {
+        let mut list = FreeList {
             nodes,
             total_size,
-            head,
-        }
+            head: NONE,
+        };
+        list.clear();
+        list
     }
 
     /// Size of the region in bytes.
@@ -289,27 +280,18 @@ impl<S: AsRef<[Node]> + AsMut<[Node]>> FreeList<S> {
         new_nodes: S2,
     ) -> (FreeList<S2>, S) {
         assert!(new_size >= self.total_size, "a freelist can only grow");
+        let count = self.free_ranges().count();
         let mut list = FreeList::with_storage(new_size, new_nodes);
-        let ranges: Vec<(u64, u64)> = self.free_ranges().collect();
-        {
-            // Rebuild the old free ranges, then free the new tail, which merges
-            // with the last range if it ended at the old size.
-            let nodes = list.nodes.as_mut();
-            assert!(
-                nodes.len() > ranges.len(),
-                "new freelist storage is too small"
-            );
-            nodes.fill(Node::EMPTY);
-            for (i, &(offset, size)) in ranges.iter().enumerate() {
-                let next = if i + 1 < ranges.len() {
-                    i as u32 + 1
-                } else {
-                    NONE
-                };
-                nodes[i] = Node { offset, size, next };
-            }
-            list.head = if ranges.is_empty() { NONE } else { 0 };
+        // Rebuild the old free ranges, then free the new tail, which merges
+        // with the last range if it ended at the old size.
+        let nodes = list.nodes.as_mut();
+        assert!(nodes.len() > count, "new freelist storage is too small");
+        nodes[0] = Node::EMPTY; // `with_storage` put the whole region here
+        for (i, (offset, size)) in self.free_ranges().enumerate() {
+            let next = if i + 1 < count { i as u32 + 1 } else { NONE };
+            nodes[i] = Node { offset, size, next };
         }
+        list.head = if count == 0 { NONE } else { 0 };
         if new_size > self.total_size {
             list.free_block(new_size - self.total_size, self.total_size)
                 .expect("the grown tail cannot overlap existing ranges");

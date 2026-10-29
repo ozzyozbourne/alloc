@@ -700,14 +700,14 @@ ol.steps > li { margin:10px 0; }
 
 $ tools/run_verus.sh
 verification results:: 16 verified, 0 errors
-time: 3.22 s, peak memory: 322 MB
+time: 3.25 s, peak memory: 322 MB
 
 # Demo: tools/run_verus.sh --compile -o /tmp/demo &amp;&amp; /tmp/demo
 old handle Handle { idx: 0, generation: 1 }, new handle Handle { idx: 0, generation: 2 }
 1000 slots: 32000 bytes from the counting allocator
-get(h) = Some(&quot;hello&quot;)
-remove(h) = Some(&quot;hello&quot;)
-after reuse: get(h) = None, get(h2) = Some(&quot;again&quot;), len = 1
+get(h) = Some("hello")
+remove(h) = Some("hello")
+after reuse: get(h) = None, get(h2) = Some("again"), len = 1
 capacity = 1000
 after drop: 0 bytes live
 
@@ -744,7 +744,7 @@ VERUS=/path/to/verus python3 tools/verus_mutants.py              # every planted
 <p>This folder is not in the Cargo workspace, because Verus brings its own compiler (Rust 1.99, so <code>#![feature(allocator_api)]</code> is still needed there).</p>
 
 <h2 id="files">9. Full source</h2>
-<details class="file"><summary>Show the whole file: src/handle_map.rs (617 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/handle_map.rs">src/handle_map.rs</a></span><span>lines 1–617</span></figcaption><pre><code><span style="color: #A5D6FF">//! A handle map proved correct with Verus for every capacity.</span>
+<details class="file"><summary>Show the whole file: src/handle_map.rs (616 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/handle_map.rs">src/handle_map.rs</a></span><span>lines 1–616</span></figcaption><pre><code><span style="color: #A5D6FF">//! A handle map proved correct with Verus for every capacity.</span>
 <span style="color: #A5D6FF">//!</span>
 <span style="color: #A5D6FF">//! Same design as `08-verified-handle-map`, which Kani checks at capacity 4:</span>
 <span style="color: #A5D6FF">//! - a handle is a slot index plus a generation;</span>
@@ -1361,7 +1361,7 @@ VERUS=/path/to/verus python3 tools/verus_mutants.py              # every planted
 
 <span style="color: #E6EDF3">}</span><span style="color: #6E7681"> </span><span style="color: #8B949E; font-style: italic">// verus!</span>
 </code></pre></figure></details>
-<details class="file"><summary>Show the whole file: src/main.rs (129 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/main.rs">src/main.rs</a></span><span>lines 1–129</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">// Not needed from Rust 1.100, where the allocator API is stable. Verus still</span>
+<details class="file"><summary>Show the whole file: src/main.rs (128 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/main.rs">src/main.rs</a></span><span>lines 1–128</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">// Not needed from Rust 1.100, where the allocator API is stable. Verus still</span>
 <span style="color: #8B949E; font-style: italic">// builds on Rust 1.99.</span>
 <span style="color: #8B949E; font-weight: bold; font-style: italic">#![feature(allocator_api)]</span>
 

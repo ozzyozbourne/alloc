@@ -255,8 +255,7 @@ vsync = on
 scratch arenas on this thread: 1
   parse_config used 136 scratch bytes
 parsed into a scratch arena: [("theme", "dark")]
-scratch arenas on this thread: 2
-</code></pre></figure>
+scratch arenas on this thread: 2</code></pre></figure>
 <p>The first call uses one scratch arena. The second call runs while <code>main</code> holds a scratch arena as the output, so the callee gets a second one automatically, and the thread now has two, the same number RAD uses.</p>
 
 <h2 id="build">6. Building it yourself, step by step</h2>
@@ -306,7 +305,7 @@ scratch arenas on this thread: 2
 </code></pre></figure>
 
 <h2 id="files">8. Full source</h2>
-<details class="file"><summary>Show the whole file: src/lib.rs (75 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–75</span></figcaption><pre><code><span style="color: #A5D6FF">//! A port of the RAD Debugger's scratch arenas (`src/base/base_thread_context.c`).</span>
+<details class="file"><summary>Show the whole file: src/lib.rs (74 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–74</span></figcaption><pre><code><span style="color: #A5D6FF">//! A port of the RAD Debugger's scratch arenas (`src/base/base_thread_context.c`).</span>
 <span style="color: #A5D6FF">//!</span>
 <span style="color: #A5D6FF">//! Every thread has a few arenas for temporary work. A function that needs</span>
 <span style="color: #A5D6FF">//! scratch memory borrows one, uses it, and pops it back when it is done. In C:</span>
@@ -381,7 +380,7 @@ scratch arenas on this thread: 2
 <span style="color: #6E7681">    </span><span style="color: #E6EDF3">with_scratch(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">a</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">with_scratch(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">b</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">f(a,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">b)))</span>
 <span style="color: #E6EDF3">}</span>
 </code></pre></figure></details>
-<details class="file"><summary>Show the whole file: original-c/base_thread_context.h (138 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.h">original-c/base_thread_context.h</a></span><span>lines 1–138</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">// Copyright (c) Epic Games Tools</span>
+<details class="file"><summary>Show the whole file: original-c/base_thread_context.h (137 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.h">original-c/base_thread_context.h</a></span><span>lines 1–137</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">// Copyright (c) Epic Games Tools</span>
 <span style="color: #8B949E; font-style: italic">// Licensed under the MIT license (https://opensource.org/license/mit/)</span>
 
 <span style="color: #8B949E; font-weight: bold; font-style: italic">#ifndef BASE_THREAD_CONTEXT_H</span>
@@ -519,7 +518,7 @@ scratch arenas on this thread: 2
 
 <span style="color: #8B949E; font-weight: bold; font-style: italic">#endif </span><span style="color: #8B949E; font-style: italic">// BASE_THREAD_CONTEXT_H</span>
 </code></pre></figure></details>
-<details class="file"><summary>Show the whole file: original-c/base_thread_context.c (232 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.c">original-c/base_thread_context.c</a></span><span>lines 1–232</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">// Copyright (c) Epic Games Tools</span>
+<details class="file"><summary>Show the whole file: original-c/base_thread_context.c (231 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/base_thread_context.c">original-c/base_thread_context.c</a></span><span>lines 1–231</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">// Copyright (c) Epic Games Tools</span>
 <span style="color: #8B949E; font-style: italic">// Licensed under the MIT license (https://opensource.org/license/mit/)</span>
 
 <span style="color: #8B949E; font-style: italic">////////////////////////////////</span>

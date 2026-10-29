@@ -102,10 +102,6 @@ impl Pos {
     }
 }
 
-fn round_up(n: usize, to: usize) -> Option<usize> {
-    n.checked_next_multiple_of(to)
-}
-
 impl Arena {
     /// Creates an arena with the default 64 MiB reserve and 64 KiB commit step.
     /// C: `arena_alloc()`.
@@ -119,15 +115,21 @@ impl Arena {
     /// If the OS refuses the reservation. C aborts in that case.
     pub fn with_params(params: ArenaParams) -> Self {
         let page = os::page_size();
-        let reserve_size =
-            round_up(params.reserve_size.max(HEADER_SIZE), page).expect("reserve size overflows");
-        let commit_size = round_up(params.commit_size.max(1), page)
+        let reserve_size = params
+            .reserve_size
+            .max(HEADER_SIZE)
+            .checked_next_multiple_of(page)
+            .expect("reserve size overflows");
+        let commit_size = params
+            .commit_size
+            .max(1)
+            .checked_next_multiple_of(page)
             .expect("commit size overflows")
             .min(reserve_size);
         let params = ArenaParams {
             reserve_size,
             commit_size,
-            chain: params.chain,
+            ..params
         };
         let first = Self::new_block(reserve_size, commit_size, 0, None)
             .expect("failed to reserve arena memory");
@@ -207,7 +209,7 @@ impl Arena {
             let need = HEADER_SIZE
                 .checked_add(layout.size())
                 .and_then(|n| n.checked_add(layout.align()))
-                .and_then(|n| round_up(n, page))
+                .and_then(|n| n.checked_next_multiple_of(page))
                 .ok_or(AllocError)?;
             let res = self.params.reserve_size.max(need);
             let cmt = self.params.commit_size.max(need.min(res));
@@ -235,7 +237,10 @@ impl Arena {
         let addr = block.addr().get();
         // SAFETY: forwarded from the caller.
         let pos = unsafe { (*block.as_ptr()).pos };
-        let start = round_up(addr + pos, layout.align()).ok_or(AllocError)? - addr;
+        let start = (addr + pos)
+            .checked_next_multiple_of(layout.align())
+            .ok_or(AllocError)?
+            - addr;
         let end = start.checked_add(layout.size()).ok_or(AllocError)?;
         Ok((start, end))
     }
@@ -252,7 +257,10 @@ impl Arena {
             if (*b).cmt >= end {
                 return Ok(());
             }
-            let new_cmt = round_up(end, step).ok_or(AllocError)?.min((*b).res);
+            let new_cmt = end
+                .checked_next_multiple_of(step)
+                .ok_or(AllocError)?
+                .min((*b).res);
             let from = block.cast::<u8>().add((*b).cmt);
             if !os::commit(from, new_cmt - (*b).cmt) {
                 return Err(AllocError);

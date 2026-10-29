@@ -2,7 +2,7 @@
 
 $ tools/run_verus.sh
 verification results:: 16 verified, 0 errors
-time: 3.22 s, peak memory: 322 MB
+time: 3.25 s, peak memory: 322 MB
 
 # Demo: tools/run_verus.sh --compile -o /tmp/demo && /tmp/demo
 old handle Handle { idx: 0, generation: 1 }, new handle Handle { idx: 0, generation: 2 }

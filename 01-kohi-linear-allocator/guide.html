@@ -319,8 +319,7 @@ frame 1: 8 commands, label "frame", used 560 of 65536 bytes
 frame 2: 8 commands, label "frame", used 560 of 65536 bytes
   u8 at 0x…, next u64 at 0x… (aligned to 8: true)
   after free_all: used 0 bytes
-stack buffer: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100], used 20 of 256 bytes
-</code></pre></figure>
+stack buffer: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100], used 20 of 256 bytes</code></pre></figure>
 <p>The same addresses repeat every frame because <code>free_all</code> hands the same memory out again.</p>
 
 <h2 id="build">7. Building it yourself, step by step</h2>
@@ -352,7 +351,7 @@ stack buffer: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100], used 20 of 256 bytes
 </code></pre></figure>
 
 <h2 id="files">9. Full source</h2>
-<details class="file"><summary>Show the whole file: src/lib.rs (149 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–149</span></figcaption><pre><code><span style="color: #A5D6FF">//! A port of Kohi's `linear_allocator` (`kohi.core/src/memory/allocators/linear_allocator.c`).</span>
+<details class="file"><summary>Show the whole file: src/lib.rs (148 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–148</span></figcaption><pre><code><span style="color: #A5D6FF">//! A port of Kohi's `linear_allocator` (`kohi.core/src/memory/allocators/linear_allocator.c`).</span>
 <span style="color: #A5D6FF">//!</span>
 <span style="color: #A5D6FF">//! A linear allocator hands out memory from one block by moving an offset forward.</span>
 <span style="color: #A5D6FF">//! Single allocations are never freed; [`LinearAllocator::free_all`] resets the</span>
@@ -501,7 +500,7 @@ stack buffer: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100], used 20 of 256 bytes
 <span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
 <span style="color: #E6EDF3">}</span>
 </code></pre></figure></details>
-<details class="file"><summary>Show the whole file: original-c/linear_allocator.h (73 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.h">original-c/linear_allocator.h</a></span><span>lines 1–73</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
+<details class="file"><summary>Show the whole file: original-c/linear_allocator.h (72 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.h">original-c/linear_allocator.h</a></span><span>lines 1–72</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
 <span style="color: #8B949E; font-style: italic"> * @file linear_allocator.h</span>
 <span style="color: #8B949E; font-style: italic"> * @author Travis Vroman (travis@kohiengine.com)</span>
 <span style="color: #8B949E; font-style: italic"> * @brief This file contains the linear allocator implementation.</span>
@@ -574,7 +573,7 @@ stack buffer: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100], used 20 of 256 bytes
 <span style="color: #8B949E; font-style: italic"> */</span>
 <span style="color: #E6EDF3">KAPI</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">void</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">linear_allocator_free_all</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(linear_allocator</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">allocator,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">b8</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">clear);</span>
 </code></pre></figure></details>
-<details class="file"><summary>Show the whole file: original-c/linear_allocator.c (60 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.c">original-c/linear_allocator.c</a></span><span>lines 1–60</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
+<details class="file"><summary>Show the whole file: original-c/linear_allocator.c (59 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/linear_allocator.c">original-c/linear_allocator.c</a></span><span>lines 1–59</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
 <span style="color: #8B949E; font-style: italic"> * @file linear_allocator.c</span>
 <span style="color: #8B949E; font-style: italic"> * @copyright Kohi Game Engine is Copyright (c) Travis Vroman 2021-2026</span>
 <span style="color: #8B949E; font-style: italic"> */</span>

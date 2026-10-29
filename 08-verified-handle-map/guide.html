@@ -69,7 +69,7 @@ ol.steps > li { margin:10px 0; }
 <h2 id="others">2. The two implementations it is compared with</h2>
 <h3>Odin: <code>Static_Handle_Map</code></h3>
 <p>Odin's standard library now ships a handle map. The static version keeps a fixed <code>[N]T</code> inline, a parallel array of free-list links, and requires <code>T</code> to have a <code>handle</code> field. Slot 0 is a dummy so that a zero handle means "none".</p>
-<details class="file"><summary>Show the whole file: original/static_handle_map.odin (158 lines)</summary><figure class="code c"><figcaption><span><span class="lang">Odin</span> <a href="original/static_handle_map.odin">original/static_handle_map.odin</a></span><span>lines 1–158</span></figcaption><pre><code><span style="color: #F0883E; font-weight: bold">package</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">container_handle_map</span>
+<details class="file"><summary>Show the whole file: original/static_handle_map.odin (157 lines)</summary><figure class="code c"><figcaption><span><span class="lang">Odin</span> <a href="original/static_handle_map.odin">original/static_handle_map.odin</a></span><span>lines 1–157</span></figcaption><pre><code><span style="color: #F0883E; font-weight: bold">package</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">container_handle_map</span>
 
 <span style="color: #F0883E; font-weight: bold">import</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"base:builtin"</span>
 <span style="color: #F0883E; font-weight: bold">import</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">"base:intrinsics"</span>
@@ -294,7 +294,7 @@ ptr.handle.gen = auto_cast (prev_gen + 1)</code></pre></figure>
 <span style="color: #E6EDF3">}</span>
 </code></pre></figure>
 <h3>Operations</h3>
-<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 156–173</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Moves `value` into a free slot and returns its handle, or gives the</span>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 151–168</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Moves `value` into a free slot and returns its handle, or gives the</span>
 <span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// value back if every slot is taken or retired.</span>
 <span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">add</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">value:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">T</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Result</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">Handle</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">G</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">T</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
 <span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">idx</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.free_head;</span>
@@ -313,7 +313,7 @@ ptr.handle.gen = auto_cast (prev_gen + 1)</code></pre></figure>
 <span style="color: #6E7681">        </span><span style="color: #E6EDF3">Ok(Handle</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">idx,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">generation</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">})</span>
 <span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
 </code></pre></figure>
-<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 189–203</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Removes and returns the value `h` refers to. Afterwards `h`, and every</span>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 184–198</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Removes and returns the value `h` refers to. Afterwards `h`, and every</span>
 <span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// other handle to that value, never resolves again.</span>
 <span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">remove</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">h:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Handle</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">G</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Option</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">T</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
 <span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.live_index(h)</span><span style="color: #FF7B72; font-weight: bold">?</span><span style="color: #E6EDF3">;</span>
@@ -322,14 +322,14 @@ ptr.handle.gen = auto_cast (prev_gen + 1)</code></pre></figure>
 <span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// SAFETY: the slot was occupied, and is now marked free, so the value</span>
 <span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// is moved out exactly once.</span>
 <span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">value</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.values[i].assume_init_read()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
-<span style="color: #6E7681">        </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!</span><span style="color: #E6EDF3">(RETIRE</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.generation[i]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">==</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">G::MAX)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!</span><span style="color: #E6EDF3">self.is_retired(i)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
 <span style="color: #6E7681">            </span><span style="color: #E6EDF3">self.next_free[i]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.free_head;</span>
 <span style="color: #6E7681">            </span><span style="color: #E6EDF3">self.free_head</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">h.idx;</span>
 <span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
 <span style="color: #6E7681">        </span><span style="color: #E6EDF3">Some(value)</span>
 <span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
 </code></pre></figure>
-<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 175–180</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// The value `h` refers to, if it is still in the map.</span>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 170–175</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// The value `h` refers to, if it is still in the map.</span>
 <span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">get</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #E6EDF3">self,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">h:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Handle</span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #E6EDF3">G</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Option</span><span style="color: #FF7B72; font-weight: bold">&lt;&amp;</span><span style="color: #E6EDF3">T</span><span style="color: #FF7B72; font-weight: bold">&gt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
 <span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.live_index(h)</span><span style="color: #FF7B72; font-weight: bold">?</span><span style="color: #E6EDF3">;</span>
 <span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// SAFETY: occupied slots are initialized.</span>
@@ -338,7 +338,7 @@ ptr.handle.gen = auto_cast (prev_gen + 1)</code></pre></figure>
 </code></pre></figure>
 <h3>The invariant</h3>
 <p>Everything the proofs rely on is written down in one function. It never reads values, only bookkeeping:</p>
-<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 226–262</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Checks the bookkeeping. Used by the proofs and by debug assertions in</span>
+<figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 225–261</span></figcaption><pre><code><span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Checks the bookkeeping. Used by the proofs and by debug assertions in</span>
 <span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// the tests; it never reads values.</span>
 <span style="color: #6E7681">    </span><span style="color: #A5D6FF">///</span>
 <span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// 1. `len` equals the number of occupied slots.</span>
@@ -468,28 +468,28 @@ ptr.handle.gen = auto_cast (prev_gen + 1)</code></pre></figure>
 <figure class="code out"><figcaption><span><span class="lang">Output</span> KANI_RESULTS.txt</span></figcaption><pre><code># cargo kani 0.68.0, CaDiCaL, capacity N = 4, run 2026-10-29 on a 4 GB orb
 
 harness                                                      result     seconds    peak_MB
-proofs::u8_gen::add_is_correct                               OK            7.58        228
-proofs::u8_gen::arbitrary_maps_cover_interesting_states      OK            4.12        222
-proofs::u8_gen::get_mut_writes_only_its_slot                 OK            3.59        223
-proofs::u8_gen::iter_yields_exactly_the_live_values          OK           11.27        438
-proofs::u8_gen::new_map_is_valid                             OK            1.58        163
-proofs::u8_gen::remove_is_correct                            OK            6.48        225
-proofs::u8_gen::removed_handle_stays_dead_after_reuse        OK            3.59        222
-proofs::u8_gen::values_are_dropped_exactly_once              OK            3.31        223
-proofs::u32_gen::add_is_correct                              OK            7.84        228
-proofs::u32_gen::arbitrary_maps_cover_interesting_states     OK            4.24        225
-proofs::u32_gen::get_mut_writes_only_its_slot                OK            4.38        223
-proofs::u32_gen::iter_yields_exactly_the_live_values         OK           17.06        460
-proofs::u32_gen::new_map_is_valid                            OK            1.50        163
-proofs::u32_gen::remove_is_correct                           OK            6.60        224
-proofs::u32_gen::removed_handle_stays_dead_after_reuse       OK            3.68        221
-proofs::u32_gen::values_are_dropped_exactly_once             OK            3.10        223
+proofs::u8_gen::add_is_correct                               OK            7.61        227
+proofs::u8_gen::arbitrary_maps_cover_interesting_states      OK            4.43        221
+proofs::u8_gen::get_mut_writes_only_its_slot                 OK            3.83        222
+proofs::u8_gen::iter_yields_exactly_the_live_values          OK           10.79        436
+proofs::u8_gen::new_map_is_valid                             OK            1.19        163
+proofs::u8_gen::remove_is_correct                            OK            6.36        223
+proofs::u8_gen::removed_handle_stays_dead_after_reuse        OK            3.46        220
+proofs::u8_gen::values_are_dropped_exactly_once              OK            3.10        222
+proofs::u32_gen::add_is_correct                              OK            6.98        227
+proofs::u32_gen::arbitrary_maps_cover_interesting_states     OK            4.07        224
+proofs::u32_gen::get_mut_writes_only_its_slot                OK            3.99        222
+proofs::u32_gen::iter_yields_exactly_the_live_values         OK           16.31        456
+proofs::u32_gen::new_map_is_valid                            OK            1.21        163
+proofs::u32_gen::remove_is_correct                           OK            6.80        223
+proofs::u32_gen::removed_handle_stays_dead_after_reuse       OK            3.72        220
+proofs::u32_gen::values_are_dropped_exactly_once             OK            3.08        222
 
 # KANI_FEATURES=naive-generations (wrapping generations, like slotmap and Odin)
 
 harness                                                      result     seconds    peak_MB
 proofs::u8_gen::add_is_correct                               FAILED        5.65        228
-    Failed Checks: &quot;add reissued an old generation&quot;</code></pre></figure>
+    Failed Checks: "add reissued an old generation"</code></pre></figure>
 <p>Every harness finishes in under 20 seconds and under 500 MB.</p>
 
 <h3>Do the proofs catch bugs?</h3>
@@ -670,8 +670,7 @@ target is gone (generation 1 != 2)
   slot 1 gen 2: pickup at [5.0, 1.0]
 added a in slot 2
 added b in slot 3
-map full, got c back
-</code></pre></figure>
+map full, got c back</code></pre></figure>
 
 <h2 id="run">10. Running the proofs</h2>
 <figure class="code out"><figcaption><span><span class="lang">Shell</span> from the repository root</span></figcaption><pre><code>cargo install --locked kani-verifier &amp;&amp; cargo kani setup
@@ -682,7 +681,7 @@ cargo test -p verified_handle_map
 cargo +nightly miri test -p verified_handle_map</code></pre></figure>
 
 <h2 id="files">11. Full source</h2>
-<details class="file"><summary>Show the whole file: src/lib.rs (281 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–281</span></figcaption><pre><code><span style="color: #A5D6FF">//! A fixed-capacity handle map that owns its slot memory, with Kani proofs.</span>
+<details class="file"><summary>Show the whole file: src/lib.rs (279 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–279</span></figcaption><pre><code><span style="color: #A5D6FF">//! A fixed-capacity handle map that owns its slot memory, with Kani proofs.</span>
 <span style="color: #A5D6FF">//!</span>
 <span style="color: #A5D6FF">//! A handle map stores values in slots and gives out [`Handle`]s: a slot index</span>
 <span style="color: #A5D6FF">//! plus a generation. When a value is removed, its slot's generation changes,</span>
@@ -786,12 +785,7 @@ cargo +nightly miri test -p verified_handle_map</code></pre></figure>
 <span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Creates an empty map. All `N` slots start on the free list.</span>
 <span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">new</span><span style="color: #E6EDF3">()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">-&gt;</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">Self</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
 <span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">()</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Self::CAPACITY_OK;</span>
-<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">next_free</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[NONE;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">N];</span>
-<span style="color: #6E7681">        </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(i,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">next)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">in</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">next_free.iter_mut().enumerate()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
-<span style="color: #6E7681">            </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">N</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
-<span style="color: #6E7681">                </span><span style="color: #FF7B72; font-weight: bold">*</span><span style="color: #E6EDF3">next</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">as</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">u32</span><span style="color: #E6EDF3">;</span>
-<span style="color: #6E7681">            </span><span style="color: #E6EDF3">}</span>
-<span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">next_free</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">std::array::from_fn(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">i</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&lt;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">N</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">(i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">+</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">1</span><span style="color: #E6EDF3">)</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">as</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">u32</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">}</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">else</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">NONE</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">});</span>
 <span style="color: #6E7681">        </span><span style="color: #E6EDF3">HandleMap</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
 <span style="color: #6E7681">            </span><span style="color: #E6EDF3">values:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[</span><span style="color: #FF7B72">const</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">MaybeUninit::uninit()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">N],</span>
 <span style="color: #6E7681">            </span><span style="color: #E6EDF3">occupied:</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">[</span><span style="color: #79C0FF">false</span><span style="color: #E6EDF3">;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">N],</span>
@@ -879,7 +873,7 @@ cargo +nightly miri test -p verified_handle_map</code></pre></figure>
 <span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// SAFETY: the slot was occupied, and is now marked free, so the value</span>
 <span style="color: #6E7681">        </span><span style="color: #8B949E; font-style: italic">// is moved out exactly once.</span>
 <span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">value</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">unsafe</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.values[i].assume_init_read()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">};</span>
-<span style="color: #6E7681">        </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!</span><span style="color: #E6EDF3">(RETIRE</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">&amp;&amp;</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.generation[i]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">==</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">G::MAX)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">!</span><span style="color: #E6EDF3">self.is_retired(i)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
 <span style="color: #6E7681">            </span><span style="color: #E6EDF3">self.next_free[i]</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.free_head;</span>
 <span style="color: #6E7681">            </span><span style="color: #E6EDF3">self.free_head</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">h.idx;</span>
 <span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
@@ -888,10 +882,14 @@ cargo +nightly miri test -p verified_handle_map</code></pre></figure>
 
 <span style="color: #6E7681">    </span><span style="color: #A5D6FF">/// Removes every value. Slot generations are kept, so old handles stay dead.</span>
 <span style="color: #6E7681">    </span><span style="color: #FF7B72">pub</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">clear</span><span style="color: #E6EDF3">(</span><span style="color: #FF7B72; font-weight: bold">&amp;</span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self)</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
-<span style="color: #6E7681">        </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">mut</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">handles</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">Vec::with_capacity(self.len());</span>
-<span style="color: #6E7681">        </span><span style="color: #E6EDF3">handles.extend(self.iter().map(</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #E6EDF3">(h,</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">_)</span><span style="color: #FF7B72; font-weight: bold">|</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">h));</span>
-<span style="color: #6E7681">        </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">h</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">in</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">handles</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
-<span style="color: #6E7681">            </span><span style="color: #E6EDF3">self.remove(h);</span>
+<span style="color: #6E7681">        </span><span style="color: #FF7B72">for</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">in</span><span style="color: #6E7681"> </span><span style="color: #A5D6FF">0</span><span style="color: #FF7B72; font-weight: bold">..</span><span style="color: #E6EDF3">N</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">            </span><span style="color: #FF7B72">if</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.occupied[i]</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">                </span><span style="color: #FF7B72">let</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">generation</span><span style="color: #6E7681"> </span><span style="color: #FF7B72; font-weight: bold">=</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">self.generation[i];</span>
+<span style="color: #6E7681">                </span><span style="color: #E6EDF3">self.remove(Handle</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
+<span style="color: #6E7681">                    </span><span style="color: #E6EDF3">idx:</span><span style="color: #6E7681"> </span><span style="color: #F0883E; font-weight: bold">i</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">as</span><span style="color: #6E7681"> </span><span style="color: #FF7B72">u32</span><span style="color: #E6EDF3">,</span>
+<span style="color: #6E7681">                    </span><span style="color: #E6EDF3">generation,</span>
+<span style="color: #6E7681">                </span><span style="color: #E6EDF3">});</span>
+<span style="color: #6E7681">            </span><span style="color: #E6EDF3">}</span>
 <span style="color: #6E7681">        </span><span style="color: #E6EDF3">}</span>
 <span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
 
@@ -963,7 +961,7 @@ cargo +nightly miri test -p verified_handle_map</code></pre></figure>
 <span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
 <span style="color: #E6EDF3">}</span>
 </code></pre></figure></details>
-<details class="file"><summary>Show the whole file: src/proofs.rs (257 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/proofs.rs">src/proofs.rs</a></span><span>lines 1–257</span></figcaption><pre><code><span style="color: #A5D6FF">//! Kani proof harnesses. Run with `cargo kani -p verified_handle_map`, or one at</span>
+<details class="file"><summary>Show the whole file: src/proofs.rs (256 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/proofs.rs">src/proofs.rs</a></span><span>lines 1–256</span></figcaption><pre><code><span style="color: #A5D6FF">//! Kani proof harnesses. Run with `cargo kani -p verified_handle_map`, or one at</span>
 <span style="color: #A5D6FF">//! a time with `tools/run_kani.sh`.</span>
 <span style="color: #A5D6FF">//!</span>
 <span style="color: #A5D6FF">//! Every harness except `new_map_is_valid` starts from an *arbitrary* map: any</span>

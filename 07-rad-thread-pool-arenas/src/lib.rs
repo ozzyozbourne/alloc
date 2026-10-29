@@ -86,7 +86,7 @@ impl WorkerArenas {
     {
         let workers = self.arenas.len();
         let task = &task;
-        let mut per_worker: Vec<Vec<(usize, R)>> = std::thread::scope(|s| {
+        let per_worker: Vec<Vec<R>> = std::thread::scope(|s| {
             let handles: Vec<_> = self
                 .arenas
                 .iter_mut()
@@ -97,7 +97,7 @@ impl WorkerArenas {
                         let arena: &'a Arena = arena;
                         (w..task_count)
                             .step_by(workers)
-                            .map(|i| (i, task(arena, i)))
+                            .map(|i| task(arena, i))
                             .collect()
                     })
                 })
@@ -108,13 +108,10 @@ impl WorkerArenas {
                 .collect()
         });
 
-        let mut results: Vec<Option<R>> = (0..task_count).map(|_| None).collect();
-        for (i, r) in per_worker.iter_mut().flat_map(|v| v.drain(..)) {
-            results[i] = Some(r);
-        }
-        results
-            .into_iter()
-            .map(|r| r.expect("every task ran"))
+        // Task `i` was the `i / workers`-th result of worker `i % workers`.
+        let mut per_worker: Vec<_> = per_worker.into_iter().map(Vec::into_iter).collect();
+        (0..task_count)
+            .map(|i| per_worker[i % workers].next().expect("every task ran"))
             .collect()
     }
 }

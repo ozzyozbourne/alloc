@@ -765,8 +765,7 @@ System memory use (tagged):
 Total: 1.62KiB of 1.00MiB used (incl. overhead), 1 live allocations
 
 filled the heap with 991 blocks, freed every other one: 524200 bytes free, but a 4000-byte request fails (no hole is big enough)
-after freeing everything: 1048576 of 1048576 bytes free
-</code></pre></figure>
+after freeing everything: 1048576 of 1048576 bytes free</code></pre></figure>
 <p>The last part shows fragmentation, the main weakness of a freelist heap: after freeing every other block, half the heap is free, but no single hole is big enough for a 4 KB request. Once everything is freed, the ranges merge back into one and all 1,048,576 bytes are free again.</p>
 <h3>As the global allocator</h3>
 <figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="examples/global_allocator.rs">examples/global_allocator.rs</a></span><span>lines 8–33</span></figcaption><pre><code><span style="color: #FF7B72">fn</span><span style="color: #6E7681"> </span><span style="color: #D2A8FF; font-weight: bold">main</span><span style="color: #E6EDF3">()</span><span style="color: #6E7681"> </span><span style="color: #E6EDF3">{</span>
@@ -807,8 +806,7 @@ System memory use (tagged):
   RENDERER  : 0.00B
   GAME      : 0.00B
   SCENE     : 0.00B
-Total: 2.11KiB of 7.00MiB used (incl. overhead), 13 live allocations
-</code></pre></figure>
+Total: 2.11KiB of 7.00MiB used (incl. overhead), 13 live allocations</code></pre></figure>
 <p>Even the <code>HashMap</code>, the thread spawn and std's own start-up allocations land in the Kohi heap. They are tagged <code>UNKNOWN</code>, because <code>GlobalAlloc</code> has no way to pass a tag.</p>
 
 <h2 id="build">7. Building it yourself, step by step</h2>
@@ -869,7 +867,7 @@ Total: 2.11KiB of 7.00MiB used (incl. overhead), 13 live allocations
 </code></pre></figure>
 
 <h2 id="files">9. Full source</h2>
-<details class="file"><summary>Show the whole file: src/lib.rs (618 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–618</span></figcaption><pre><code><span style="color: #A5D6FF">//! A port of Kohi's `dynamic_allocator` (`kohi.core/src/memory/allocators/dynamic_allocator.c`)</span>
+<details class="file"><summary>Show the whole file: src/lib.rs (617 lines)</summary><figure class="code rs"><figcaption><span><span class="lang">Rust</span> <a href="src/lib.rs">src/lib.rs</a></span><span>lines 1–617</span></figcaption><pre><code><span style="color: #A5D6FF">//! A port of Kohi's `dynamic_allocator` (`kohi.core/src/memory/allocators/dynamic_allocator.c`)</span>
 <span style="color: #A5D6FF">//! and of the parts of `kmemory.c` that sit on top of it: memory tags, usage</span>
 <span style="color: #A5D6FF">//! stats, a mutex, and use as the engine-wide allocator.</span>
 <span style="color: #A5D6FF">//!</span>
@@ -1487,7 +1485,7 @@ Total: 2.11KiB of 7.00MiB used (incl. overhead), 13 live allocations
 <span style="color: #6E7681">    </span><span style="color: #E6EDF3">}</span>
 <span style="color: #E6EDF3">}</span>
 </code></pre></figure></details>
-<details class="file"><summary>Show the whole file: original-c/dynamic_allocator.h (123 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/dynamic_allocator.h">original-c/dynamic_allocator.h</a></span><span>lines 1–123</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
+<details class="file"><summary>Show the whole file: original-c/dynamic_allocator.h (122 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/dynamic_allocator.h">original-c/dynamic_allocator.h</a></span><span>lines 1–122</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
 <span style="color: #8B949E; font-style: italic"> * @file dynamic_allocator.h</span>
 <span style="color: #8B949E; font-style: italic"> * @author Travis Vroman (travis@kohiengine.com)</span>
 <span style="color: #8B949E; font-style: italic"> * @brief Contains the implementation of the dynamic allocator.</span>
@@ -1610,7 +1608,7 @@ Total: 2.11KiB of 7.00MiB used (incl. overhead), 13 live allocations
 <span style="color: #8B949E; font-weight: bold; font-style: italic">#	define validate_block(block)</span>
 <span style="color: #8B949E; font-weight: bold; font-style: italic">#endif</span>
 </code></pre></figure></details>
-<details class="file"><summary>Show the whole file: original-c/dynamic_allocator.c (361 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/dynamic_allocator.c">original-c/dynamic_allocator.c</a></span><span>lines 1–361</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
+<details class="file"><summary>Show the whole file: original-c/dynamic_allocator.c (360 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/dynamic_allocator.c">original-c/dynamic_allocator.c</a></span><span>lines 1–360</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
 <span style="color: #8B949E; font-style: italic"> * @file dynamic_allocator.c</span>
 <span style="color: #8B949E; font-style: italic"> * @copyright Kohi Game Engine is Copyright (c) Travis Vroman 2021-2026</span>
 <span style="color: #8B949E; font-style: italic"> */</span>
@@ -1971,7 +1969,7 @@ Total: 2.11KiB of 7.00MiB used (incl. overhead), 13 live allocations
 <span style="color: #E6EDF3">}</span>
 <span style="color: #8B949E; font-weight: bold; font-style: italic">#endif</span>
 </code></pre></figure></details>
-<details class="file"><summary>Show the whole file: original-c/kmemory.c (531 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/kmemory.c">original-c/kmemory.c</a></span><span>lines 1–531</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
+<details class="file"><summary>Show the whole file: original-c/kmemory.c (530 lines)</summary><figure class="code c"><figcaption><span><span class="lang">C</span> <a href="original-c/kmemory.c">original-c/kmemory.c</a></span><span>lines 1–530</span></figcaption><pre><code><span style="color: #8B949E; font-style: italic">/**</span>
 <span style="color: #8B949E; font-style: italic"> * @file kmemory.c</span>
 <span style="color: #8B949E; font-style: italic"> * @copyright Kohi Game Engine is Copyright (c) Travis Vroman 2021-2026</span>
 <span style="color: #8B949E; font-style: italic"> */</span>

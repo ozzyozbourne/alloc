@@ -18,70 +18,59 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "09-verus-handle-map" / "src"
 VERUS = os.environ.get("VERUS", "verus")
 
-# (name, file, find, replacement) or (name, file, [(find, replacement), ...]).
+# Edits to src/handle_map.rs that keep retired slots in use, as slotmap and Odin do.
+NO_RETIRE = (
+    "if self.slots[i].generation != MAX_GEN {\n            self.free_head",
+    "if true {\n            self.free_head",
+)
+
+# (name, [(find, replacement), ...]) applied to src/handle_map.rs.
 # Each text to find must occur exactly once.
 MUTANTS = [
     (
         "wrap generations like slotmap/Odin",
-        "handle_map.rs",
         [
             (
                 "let generation = self.slots[i].generation + 1;",
                 "let generation = self.slots[i].generation.wrapping_add(1);",
             ),
+            NO_RETIRE,
+        ],
+    ),
+    ("put retired slots back on the free list", [NO_RETIRE]),
+    (
+        "add does not bump the generation",
+        [("let generation = self.slots[i].generation + 1;", "let generation = self.slots[i].generation;")],
+    ),
+    ("add does not advance free_head", [("self.free_head = next;", "")]),
+    ("remove leaks the slot (not pushed on the free list)", [("self.free_head = h.idx;", "")]),
+    ("remove does not decrement len", [("self.len = self.len - 1;", "")]),
+    (
+        "get ignores the generation",
+        [
             (
-                "if self.slots[i].generation != MAX_GEN {\n            self.free_head",
-                "if true {\n            self.free_head",
-            ),
+                "if i < self.slots.len() && self.slots[i].generation == h.generation {",
+                "if i < self.slots.len() {",
+            )
         ],
     ),
     (
-        "put retired slots back on the free list",
-        "handle_map.rs",
-        "if self.slots[i].generation != MAX_GEN {\n            self.free_head",
-        "if true {\n            self.free_head",
-    ),
-    (
-        "add does not bump the generation",
-        "handle_map.rs",
-        "let generation = self.slots[i].generation + 1;",
-        "let generation = self.slots[i].generation;",
-    ),
-    (
-        "add does not advance free_head",
-        "handle_map.rs",
-        "self.free_head = next;",
-        "",
-    ),
-    (
-        "remove leaks the slot (not pushed on the free list)",
-        "handle_map.rs",
-        "self.free_head = h.idx;",
-        "",
-    ),
-    (
-        "remove does not decrement len",
-        "handle_map.rs",
-        "self.len = self.len - 1;",
-        "",
-    ),
-    (
-        "get ignores the generation",
-        "handle_map.rs",
-        "if i < self.slots.len() && self.slots[i].generation == h.generation {",
-        "if i < self.slots.len() {",
-    ),
-    (
         "contains ignores occupancy",
-        "handle_map.rs",
-        "i < self.slots.len() && self.slots[i].value.is_some() && self.slots[i].generation\n            == h.generation\n    }",
-        "i < self.slots.len() && self.slots[i].generation == h.generation\n    }",
+        [
+            (
+                "self.slots[i].value.is_some() && self.slots[i].generation\n            == h.generation\n    }",
+                "self.slots[i].generation\n            == h.generation\n    }",
+            )
+        ],
     ),
     (
         "new_in builds a cyclic free list",
-        "handle_map.rs",
-        "(j + 1) as u32\n                        } else {\n                            NONE\n                        })\n                    },",
-        "(j + 1) as u32\n                        } else {\n                            0\n                        })\n                    },",
+        [
+            (
+                "(j + 1) as u32\n                        } else {\n                            NONE",
+                "(j + 1) as u32\n                        } else {\n                            0",
+            )
+        ],
     ),
 ]
 
@@ -103,17 +92,16 @@ def verify(src_dir):
 def main():
     print(f"{'planted bug':55} {'caught':6} verus", flush=True)
     accepted = 0
-    for name, file, *edits in MUTANTS:
-        edits = edits[0] if len(edits) == 1 else [tuple(edits)]
+    for name, edits in MUTANTS:
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
             for f in SRC.glob("*.rs"):
                 shutil.copy(f, tmp)
-            text = (tmp / file).read_text()
+            text = (tmp / "handle_map.rs").read_text()
             for find, repl in edits:
                 assert text.count(find) == 1, f"{name!r}: pattern found {text.count(find)} times"
                 text = text.replace(find, repl)
-            (tmp / file).write_text(text)
+            (tmp / "handle_map.rs").write_text(text)
             result, caught = verify(tmp)
         accepted += not caught
         print(f"{name:55} {'yes' if caught else 'NO':6} {result}", flush=True)

@@ -10,13 +10,14 @@
 # memory drops below MIN_AVAIL_MB (default 800) so the machine stays usable.
 set -u
 cd "$(dirname "$0")/.."
+source tools/watchdog.sh
 filter="${1:-}"
-min_avail="${MIN_AVAIL_MB:-800}"
 features=()
 [ -n "${KANI_FEATURES:-}" ] && features=(--features "$KANI_FEATURES")
 
-harnesses=$(grep -oE 'fn [a-z_0-9]+\(\)' 08-verified-handle-map/src/proofs.rs \
-  | sed -E 's/fn (.*)\(\)/\1/' | grep -v '^any' | sort -u)
+# Every `fn` directly after a `#[kani::proof]` attribute (attributes may follow).
+harnesses=$(grep -A4 'kani::proof' 08-verified-handle-map/src/proofs.rs \
+  | grep -oE 'fn [a-z_0-9]+' | sed 's/^fn //' | sort -u)
 modules=$(grep -oE '^harnesses!\([a-z0-9_]+' 08-verified-handle-map/src/proofs.rs | sed 's/harnesses!(//')
 
 printf '%-60s %-9s %8s %10s\n' harness result seconds peak_MB
@@ -25,28 +26,16 @@ for module in $modules; do
     name="proofs::$module::$h"
     [[ -n "$filter" && "$name" != *"$filter"* ]] && continue
     log=$(mktemp)
-    /usr/bin/time -f '%e %M' -o "$log.time" \
-      cargo kani -p verified_handle_map "${features[@]}" --exact --harness "$name" >"$log" 2>&1 &
-    pid=$!
-    killed=""
-    while kill -0 "$pid" 2>/dev/null; do
-      avail=$(free -m | awk '/Mem:/{print $7}')
-      if [ "$avail" -lt "$min_avail" ]; then
-        pkill -P "$pid"; pkill cbmc; kill "$pid" 2>/dev/null; killed=1; break
-      fi
-      sleep 1
-    done
-    wait "$pid" 2>/dev/null
+    run_watched "$log" cargo kani -p verified_handle_map "${features[@]}" --exact --harness "$name"
     if [ -n "$killed" ]; then result=OOM-KILLED
     elif grep -q 'VERIFICATION:- SUCCESSFUL' "$log"; then result=OK
     elif grep -q 'VERIFICATION:- FAILED' "$log"; then result=FAILED
     else result=ERROR
     fi
-    read -r secs kb < <(tail -1 "$log.time") 2>/dev/null || { secs=-; kb=0; }
     printf '%-60s %-9s %8s %10s\n' "$name" "$result" "$secs" "$((kb / 1024))"
     if [ "$result" = FAILED ] || [ "$result" = ERROR ]; then
       grep -E 'Failed Checks|^error' "$log" | head -5 | sed 's/^/    /'
     fi
-    rm -f "$log" "$log.time"
+    rm -f "$log"
   done
 done

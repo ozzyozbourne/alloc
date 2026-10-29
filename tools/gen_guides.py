@@ -21,6 +21,7 @@ Files ending in .odin are highlighted as Odin.
 matches nothing stops the build.
 """
 
+import functools
 import html
 import pathlib
 import re
@@ -29,7 +30,7 @@ import sys
 
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
-from pygments.lexers import CLexer, OdinLexer, RustLexer, TextLexer
+from pygments.lexers import CLexer, OdinLexer, RustLexer
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "tools" / "guides"
@@ -98,20 +99,35 @@ def die(msg):
     sys.exit(f"gen_guides: {msg}")
 
 
+# File suffix -> (CSS class, label, lexer).
+LANGS = {
+    ".c": ("c", "C", CLexer()),
+    ".h": ("c", "C", CLexer()),
+    ".odin": ("c", "Odin", OdinLexer()),
+    ".rs": ("rs", "Rust", RustLexer()),
+}
+
+
+@functools.cache
 def read(path):
-    return path.read_text().replace("\r", "").split("\n")
+    return tuple(path.read_text().splitlines())
 
 
-def figure(kind, lang_label, lines, start, path, folder, lexer):
+def figure(lines, start, path, base):
+    kind, label, lexer = LANGS[path.suffix]
     code = "\n".join(lines).rstrip("\n")
     end = start + len(lines) - 1
-    rel = path.relative_to(ROOT / folder) if folder else path.relative_to(ROOT)
-    where = f"lines {start}–{end}" if start else ""
+    rel = path.relative_to(base).as_posix()
     return (
-        f'<figure class="code {kind}"><figcaption><span><span class="lang">{lang_label}</span> '
-        f'<a href="{rel.as_posix()}">{html.escape(rel.as_posix())}</a></span><span>{where}</span></figcaption>'
+        f'<figure class="code {kind}"><figcaption><span><span class="lang">{label}</span> '
+        f'<a href="{rel}">{html.escape(rel)}</a></span><span>lines {start}–{end}</span></figcaption>'
         f"<pre><code>{highlight(code, lexer, FORMATTER)}</code></pre></figure>"
     )
+
+
+def output_figure(caption, text):
+    return (f'<figure class="code out"><figcaption><span><span class="lang">Output</span> '
+            f'{caption}</span></figcaption><pre><code>{html.escape(text, quote=False)}</code></pre></figure>')
 
 
 def c_item(path, needle):
@@ -142,7 +158,7 @@ def rs_item(path, needle):
         die(f"{path}: no line containing {needle!r}")
     indent = len(lines[i]) - len(lines[i].lstrip())
     start = i
-    while start > 0 and lines[start - 1].strip().startswith(("///", "#[", "// SAFETY", "//")) \
+    while start > 0 and lines[start - 1].strip().startswith(("//", "#[")) \
             and len(lines[start - 1]) - len(lines[start - 1].lstrip()) == indent:
         start -= 1
     end = i
@@ -155,13 +171,14 @@ def rs_item(path, needle):
     return lines[start:end + 1], start + 1
 
 
+@functools.cache
 def run_example(crate, example):
     res = subprocess.run(["cargo", "run", "-q", "-p", crate, "--example", example],
                          cwd=ROOT, capture_output=True, text=True)
     if res.returncode != 0:
         die(f"example {crate}/{example} failed:\n{res.stderr}")
     # Heap addresses change from run to run; show them as placeholders.
-    return re.sub(r"0x[0-9a-f]{11,}", "0x…", res.stdout).rstrip("\n").split("\n")
+    return re.sub(r"0x[0-9a-f]{11,}", "0x…", res.stdout).rstrip("\n")
 
 
 def expand(text, folder):
@@ -169,36 +186,23 @@ def expand(text, folder):
 
     def sub(m):
         kind, args = m.group(1), m.group(2).split(None, 1)
-        if kind in ("c-item", "rs-item"):
-            path = base / args[0]
-            if kind == "c-item":
-                lines, start = c_item(path, args[1])
-                return figure("c", "C", lines, start, path, folder, CLexer())
-            lines, start = rs_item(path, args[1])
-            return figure("rs", "Rust", lines, start, path, folder, RustLexer())
-        if kind == "c-lines":
-            path = base / args[0]
-            first, last = (int(n) for n in args[1].split("-"))
-            return figure("c", "C", read(path)[first - 1:last], first, path, folder, CLexer())
-        if kind in ("c-file", "rs-file"):
-            path = base / args[0]
-            lines = read(path)
-            c = kind == "c-file"
-            odin = path.suffix == ".odin"
-            fig = figure("c" if c else "rs", "Odin" if odin else "C" if c else "Rust", lines, 1, path, folder,
-                         OdinLexer() if odin else CLexer() if c else RustLexer())
-            return f'<details class="file"><summary>Show the whole file: {html.escape(args[0])} ({len(lines)} lines)</summary>{fig}</details>'
-        if kind == "text":
-            path = base / args[0]
-            return (f'<figure class="code out"><figcaption><span><span class="lang">Output</span> '
-                    f'{html.escape(args[0])}</span></figcaption>'
-                    f'<pre><code>{html.escape(path.read_text().rstrip())}</code></pre></figure>')
         if kind == "output":
             crate, example = args[0], args[1]
-            out = run_example(crate, example)
-            return (f'<figure class="code out"><figcaption><span><span class="lang">Output</span> '
-                    f'cargo run -p {crate} --example {example}</span></figcaption>'
-                    f'<pre><code>{highlight(chr(10).join(out), TextLexer(), FORMATTER)}</code></pre></figure>')
+            return output_figure(f"cargo run -p {crate} --example {example}", run_example(crate, example))
+        path = base / args[0]
+        if kind == "text":
+            return output_figure(html.escape(args[0]), path.read_text().rstrip())
+        if kind == "c-item":
+            return figure(*c_item(path, args[1]), path, base)
+        if kind == "rs-item":
+            return figure(*rs_item(path, args[1]), path, base)
+        if kind == "c-lines":
+            first, last = (int(n) for n in args[1].split("-"))
+            return figure(read(path)[first - 1:last], first, path, base)
+        if kind in ("c-file", "rs-file"):
+            lines = read(path)
+            return (f'<details class="file"><summary>Show the whole file: {html.escape(args[0])} '
+                    f'({len(lines)} lines)</summary>{figure(lines, 1, path, base)}</details>')
         die(f"unknown directive {kind}")
 
     return re.sub(r"\{\{(c-item|rs-item|c-lines|c-file|rs-file|output|text)\s+([^}]+?)\}\}", sub, text)

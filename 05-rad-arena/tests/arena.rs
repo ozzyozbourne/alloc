@@ -2,7 +2,7 @@
 
 use std::alloc::{Allocator, Layout};
 
-use rad_arena::{Arena, ArenaParams, HEADER_SIZE};
+use rad_arena::{Arena, ArenaParams};
 
 fn small() -> Arena {
     Arena::with_params(ArenaParams {
@@ -15,7 +15,6 @@ fn small() -> Arena {
 #[test]
 fn starts_after_the_header_and_aligns_every_push() {
     let arena = Arena::new();
-    assert_eq!(arena.pos().clone(), arena.pos());
     let a = arena.push(1u8);
     let a_addr = (a as *const u8).addr();
     let b = arena.push(2u64);
@@ -28,7 +27,6 @@ fn starts_after_the_header_and_aligns_every_push() {
     let s = arena.push_str("hello");
     assert_eq!(&*s, "hello");
     assert_eq!(*b, 2);
-    let _ = HEADER_SIZE;
 }
 
 #[test]
@@ -155,11 +153,12 @@ fn freeing_the_last_allocation_moves_the_top_back() {
 #[test]
 fn arenas_can_move_between_threads() {
     let arena = small();
+    let start = arena.pos();
     let arena = std::thread::spawn(move || {
         arena.push_str("from another thread");
         arena
     })
     .join()
     .unwrap();
-    assert!(arena.pos() > rad_arena::Arena::new().pos());
+    assert!(arena.pos() > start);
 }

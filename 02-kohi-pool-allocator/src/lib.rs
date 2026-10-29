@@ -29,10 +29,8 @@ pub struct PoolAllocator {
     block_layout: Layout,
     /// Size of one slot, padded to its alignment. C: `u64 element_size`.
     slot_size: usize,
-    slot_align: usize,
-    /// C: `u64 capacity`.
-    capacity: usize,
-    /// `next[i]` is the free slot after slot `i`, or `NONE`.
+    /// `next[i]` is the free slot after slot `i`, or `NONE`. Its length is
+    /// the capacity (C: `u64 capacity`).
     /// C: the `free_list_nodes` array, which stores pointers and offsets.
     next: Box<[Cell<usize>]>,
     /// First (lowest) free slot, or `NONE`. C: `free_list_head`.
@@ -50,14 +48,8 @@ impl PoolAllocator {
     pub fn new(slot: Layout, capacity: usize) -> Self {
         assert!(capacity > 0, "pool capacity must be nonzero");
         assert!(slot.size() > 0, "pool slots must have a nonzero size");
-        let slot = slot.pad_to_align();
-        let block_layout = Layout::from_size_align(
-            slot.size()
-                .checked_mul(capacity)
-                .expect("pool size overflows usize"),
-            slot.align(),
-        )
-        .expect("pool size overflows isize");
+        // `repeat` pads each slot to its alignment and checks for overflow.
+        let (block_layout, slot_size) = slot.repeat(capacity).expect("pool size overflows");
         let memory = Global
             .allocate(block_layout)
             .unwrap_or_else(|_| std::alloc::handle_alloc_error(block_layout))
@@ -71,9 +63,7 @@ impl PoolAllocator {
         PoolAllocator {
             memory,
             block_layout,
-            slot_size: slot.size(),
-            slot_align: slot.align(),
-            capacity,
+            slot_size,
             next,
             head: Cell::new(0),
             free_count: Cell::new(capacity),
@@ -104,7 +94,7 @@ impl PoolAllocator {
     pub fn index_of(&self, ptr: NonNull<u8>) -> Option<usize> {
         let offset = ptr.addr().get().checked_sub(self.memory.addr().get())?;
         let index = offset / self.slot_size;
-        (offset % self.slot_size == 0 && index < self.capacity).then_some(index)
+        (offset % self.slot_size == 0 && index < self.capacity()).then_some(index)
     }
 
     /// Number of free slots. C: `pool_allocator_elements_free`.
@@ -124,7 +114,7 @@ impl PoolAllocator {
 
     /// Number of slots.
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.next.len()
     }
 
     /// Moves `value` into a slot, or gives it back if the pool is full.
@@ -162,7 +152,7 @@ fn fatal(message: &str) -> ! {
 // - Nothing here panics.
 unsafe impl Allocator for PoolAllocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        if layout.size() > self.slot_size || layout.align() > self.slot_align {
+        if layout.size() > self.slot_size || layout.align() > self.block_layout.align() {
             return Err(AllocError);
         }
         let (ptr, _) = self.allocate_slot().ok_or(AllocError)?;

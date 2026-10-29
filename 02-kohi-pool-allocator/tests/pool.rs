@@ -76,13 +76,13 @@ fn rejects_layouts_that_do_not_fit_a_slot() {
 #[test]
 fn slots_are_aligned_for_the_element_type() {
     #[repr(align(64))]
+    #[allow(dead_code)]
     struct CacheLine([u8; 64]);
     let pool = PoolAllocator::for_type::<CacheLine>(3);
     for _ in 0..3 {
         let (ptr, _) = pool.allocate_slot().unwrap();
         assert_eq!(ptr.addr().get() % 64, 0);
     }
-    let _ = CacheLine([0; 64]).0;
 }
 
 #[test]

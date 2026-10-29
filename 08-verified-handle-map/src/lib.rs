@@ -102,12 +102,7 @@ impl<T, const N: usize, G: Generation> HandleMap<T, N, G> {
     /// Creates an empty map. All `N` slots start on the free list.
     pub fn new() -> Self {
         let () = Self::CAPACITY_OK;
-        let mut next_free = [NONE; N];
-        for (i, next) in next_free.iter_mut().enumerate() {
-            if i + 1 < N {
-                *next = (i + 1) as u32;
-            }
-        }
+        let next_free = std::array::from_fn(|i| if i + 1 < N { (i + 1) as u32 } else { NONE });
         HandleMap {
             values: [const { MaybeUninit::uninit() }; N],
             occupied: [false; N],
@@ -195,7 +190,7 @@ impl<T, const N: usize, G: Generation> HandleMap<T, N, G> {
         // SAFETY: the slot was occupied, and is now marked free, so the value
         // is moved out exactly once.
         let value = unsafe { self.values[i].assume_init_read() };
-        if !(RETIRE && self.generation[i] == G::MAX) {
+        if !self.is_retired(i) {
             self.next_free[i] = self.free_head;
             self.free_head = h.idx;
         }
@@ -204,10 +199,14 @@ impl<T, const N: usize, G: Generation> HandleMap<T, N, G> {
 
     /// Removes every value. Slot generations are kept, so old handles stay dead.
     pub fn clear(&mut self) {
-        let mut handles = Vec::with_capacity(self.len());
-        handles.extend(self.iter().map(|(h, _)| h));
-        for h in handles {
-            self.remove(h);
+        for i in 0..N {
+            if self.occupied[i] {
+                let generation = self.generation[i];
+                self.remove(Handle {
+                    idx: i as u32,
+                    generation,
+                });
+            }
         }
     }
 
