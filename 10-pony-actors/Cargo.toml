@@ -1,0 +1,10 @@
+[package]
+name = "pony_actors"
+version = "0.1.0"
+description = "Pony's actor allocation patterns (pool, per-actor heap, iso/val, MPSC mailbox), ported to Rust"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

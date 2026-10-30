@@ -9,6 +9,7 @@ members = [
     "06-rad-scratch-arenas",
     "07-rad-thread-pool-arenas",
     "08-verified-handle-map",
+    "10-pony-actors",
 ]
 
 [workspace.package]

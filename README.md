@@ -15,6 +15,7 @@ Seven custom allocators from the [Kohi game engine](https://github.com/travisvro
 | [`07-rad-thread-pool-arenas`](07-rad-thread-pool-arenas) | RAD linker per-worker arenas | `WorkerArenas` |
 | [`08-verified-handle-map`](08-verified-handle-map) | Odin `handle_map` / `slotmap`, with Kani proofs | `HandleMap<T, N, G>` |
 | [`09-verus-handle-map`](09-verus-handle-map) | 08's handle map, with Verus proofs for any capacity | `HandleMap<T, A>` |
+| [`10-pony-actors`](10-pony-actors) | Pony runtime: pool, per-actor heap, `iso`/`val`, mailbox | `Pool`, `Local`/`Remote`, `Iso`, `Val`, `System` |
 
 ## Running
 
@@ -38,3 +39,4 @@ The Rust code in this repository is original. Each `original-c/` folder holds un
 - RAD Debugger at commit `771f63d`, MIT, Copyright (c) Epic Games Tools.
 - Odin at commit `69b973e`, zlib, Copyright (c) Ginger Bill.
 - slotmap 1.1.1 at commit `eccedef`, zlib, Copyright (c) Orson Peters.
+- ponyc at commit `cc2ec5d`, BSD-2-Clause, Copyright (C) The Pony Developers and Causality Ltd.

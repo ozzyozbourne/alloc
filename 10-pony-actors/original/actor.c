@@ -1,0 +1,1333 @@
+#define PONY_WANT_ATOMIC_DEFS
+
+#include "actor.h"
+#include "../asio/event.h"
+#include "../sched/scheduler.h"
+#include "../sched/cpu.h"
+#include "../mem/pool.h"
+#include "../gc/cycle.h"
+#include "../gc/trace.h"
+#include "../tracing/tracing.h"
+#include "ponyassert.h"
+#include <assert.h>
+#include <string.h>
+
+#ifdef USE_RUNTIMESTATS
+#include <stdio.h>
+#endif
+
+#ifdef USE_VALGRIND
+#include <valgrind/helgrind.h>
+#endif
+
+// default actor batch size — defined in actor.h
+
+PONY_EXTERN_C_BEGIN
+
+// Ignore padding at the end of the type.
+pony_static_assert((offsetof(pony_actor_t, gc) + sizeof(gc_t)) ==
+   sizeof(pony_actor_pad_t), "Wrong actor pad size!");
+
+static bool actor_noblock = false;
+
+#ifdef USE_SYSTEMATIC_TESTING
+// Monotonic source of stable, creation-order actor ids
+// (pony_actor_t.systematic_testing_id). Static, so zero-initialized at process
+// load and never reset within the process. That is fine: only the relative
+// creation order within a single runtime lifetime is used, and a fixed seed
+// reproduces that order because systematic testing creates actors
+// deterministically.
+static PONY_ATOMIC(uint64_t) actor_systematic_testing_id_counter;
+#endif
+
+#ifdef USE_RUNTIMESTATS
+void print_actor_stats(pony_actor_t* actor)
+{
+  printf("Actor stats for actor: %zu, "
+        "heap memory allocated: %zu, "
+        "heap memory used: %zu, "
+        "heap num allocated: %zu, "
+        "heap realloc counter: %zu, "
+        "heap alloc counter: %zu, "
+        "heap free counter: %zu, "
+        "heap gc counter: %zu, "
+        "system cpu: %zu, "
+        "app cpu: %zu, "
+        "garbage collection marking cpu: %zu, "
+        "garbage collection sweeping cpu: %zu, "
+        "messages sent counter: %zu, "
+        "system messages processed counter: %zu, "
+        "app messages processed counter: %zu\n",
+        (uintptr_t)actor,
+        actor->actorstats.heap_mem_allocated,
+        actor->actorstats.heap_mem_used,
+        actor->actorstats.heap_num_allocated,
+        actor->actorstats.heap_realloc_counter,
+        actor->actorstats.heap_alloc_counter,
+        actor->actorstats.heap_free_counter,
+        actor->actorstats.heap_gc_counter,
+        actor->actorstats.system_cpu,
+        actor->actorstats.app_cpu,
+        actor->actorstats.gc_mark_cpu,
+        actor->actorstats.gc_sweep_cpu,
+        actor->actorstats.messages_sent_counter,
+        actor->actorstats.system_messages_processed_counter,
+        actor->actorstats.app_messages_processed_counter
+        );
+}
+#endif
+
+// The sync flags of a given actor cannot be mutated from more than one actor at
+// once, so these operations need not be atomic RMW.
+static bool has_sync_flag_any(pony_actor_t* actor, uint8_t check_flags)
+{
+  uint8_t flags = atomic_load_explicit(&actor->sync_flags, memory_order_acquire);
+  return (flags & check_flags) != 0;
+}
+
+static bool has_sync_flag(pony_actor_t* actor, uint8_t flag)
+{
+  return has_sync_flag_any(actor, flag);
+}
+
+static void set_sync_flag(pony_actor_t* actor, uint8_t flag)
+{
+  uint8_t flags = atomic_load_explicit(&actor->sync_flags, memory_order_acquire);
+  atomic_store_explicit(&actor->sync_flags, flags | flag, memory_order_release);
+}
+
+static void unset_sync_flag(pony_actor_t* actor, uint8_t flag)
+{
+  uint8_t flags = atomic_load_explicit(&actor->sync_flags, memory_order_acquire);
+  atomic_store_explicit(&actor->sync_flags, flags & (uint8_t)~flag,
+    memory_order_release);
+}
+
+// The internal flags of a given actor are only ever read or written by a
+// single scheduler at a time and so need not be synchronization safe (atomics).
+static bool has_internal_flag(pony_actor_t* actor, uint8_t flag)
+{
+  return (actor->internal_flags & flag) != 0;
+}
+
+static void set_internal_flag(pony_actor_t* actor, uint8_t flag)
+{
+  actor->internal_flags = actor->internal_flags | flag;
+}
+
+static void unset_internal_flag(pony_actor_t* actor, uint8_t flag)
+{
+  actor->internal_flags = actor->internal_flags & (uint8_t)~flag;
+}
+
+//
+// Mute/Unmute/Check mute status functions
+//
+// For backpressure related muting and unmuting to work correctly, the following
+// rules have to be maintained.
+//
+// 1. Across schedulers, an actor should never been seen as muted when it is not
+// in fact muted.
+// 2. It's ok for a muted actor to be seen as unmuted in a transient fashion
+// across actors
+//
+// If rule #1 is violated, we might end up deadlocking because an actor was
+// muted for sending to an actor that might never be unmuted (because it isn't
+// muted). The actor muted actor would continue to remain muted and the actor
+// incorrectly seen as muted became actually muted and then unmuted.
+//
+// If rule #2 is violated, then a muted actor will receive from 1 to a few
+// additional messages and the sender won't be muted. As this is a transient
+// situtation that should be shortly rectified, there's no harm done.
+//
+// Our handling of atomic operations in `mute_actor`
+// and `unmute_actor` are to assure that both rules aren't violated.
+
+static void mute_actor(pony_actor_t* actor)
+{
+  set_sync_flag(actor, ACTOR_SYNC_FLAG_MUTED);
+  TRACING_ACTOR_MUTED(actor);
+}
+
+void ponyint_unmute_actor(pony_actor_t* actor)
+{
+  unset_sync_flag(actor, ACTOR_SYNC_FLAG_MUTED);
+  TRACING_ACTOR_UNMUTED(actor);
+}
+
+static bool triggers_muting(pony_actor_t* actor)
+{
+  return has_sync_flag_any(actor, ACTOR_SYNC_FLAG_OVERLOADED |
+    ACTOR_SYNC_FLAG_UNDER_PRESSURE | ACTOR_SYNC_FLAG_MUTED);
+}
+
+static void actor_setoverloaded(pony_actor_t* actor)
+{
+  pony_assert(!ponyint_is_cycle(actor));
+  set_sync_flag(actor, ACTOR_SYNC_FLAG_OVERLOADED);
+  TRACING_ACTOR_OVERLOADED(actor);
+}
+
+static void actor_unsetoverloaded(pony_actor_t* actor)
+{
+  pony_ctx_t* ctx = pony_ctx();
+  unset_sync_flag(actor, ACTOR_SYNC_FLAG_OVERLOADED);
+  TRACING_ACTOR_NOTOVERLOADED(actor);
+  if (!has_sync_flag(actor, ACTOR_SYNC_FLAG_UNDER_PRESSURE))
+  {
+    ponyint_sched_start_global_unmute(ctx->scheduler->index, actor);
+  }
+}
+
+static void maybe_mark_should_mute(pony_ctx_t* ctx, pony_actor_t* to)
+{
+  if(ctx->current != NULL)
+  {
+    // only throttle/mute a sender IF:
+    // 1. the receiver is overloaded/under pressure/muted
+    // AND
+    // 2. the sender isn't overloaded or under pressure
+    // AND
+    // 3. we are sending to another actor (as compared to sending to self)
+    if(triggers_muting(to) && ctx->current != to)
+    {
+      ctx->current->sent_to_overloaded = true;
+      if(has_sync_flag_any(ctx->current, ACTOR_SYNC_FLAG_OVERLOADED |
+        ACTOR_SYNC_FLAG_UNDER_PRESSURE))
+      {
+        if(ctx->current->batch_size > PONY_SCHED_BATCH_STEP)
+        {
+          ctx->current->batch_size -= PONY_SCHED_BATCH_STEP;
+          TRACING_ACTOR_BATCH_SIZE_CHANGED(ctx->current);
+        }
+      }
+      else if(ctx->current->batch_size <= PONY_SCHED_BATCH_STEP)
+      {
+        ctx->current->batch_size = 0;
+        TRACING_ACTOR_BATCH_SIZE_CHANGED(ctx->current);
+        ponyint_sched_mute(ctx, ctx->current, to);
+      }
+      else
+      {
+        ctx->current->batch_size -= PONY_SCHED_BATCH_STEP;
+        TRACING_ACTOR_BATCH_SIZE_CHANGED(ctx->current);
+      }
+    }
+  }
+}
+
+// Runs whenever pony_assert does, so it must be defined then too -- including
+// a release-safe -DPONY_ALWAYS_ASSERT build, not just debug. A plain #ifndef
+// PONY_NDEBUG would drop the definition while the assert calls below remain.
+#if !defined(PONY_NDEBUG) || defined(PONY_ALWAYS_ASSERT)
+static bool well_formed_msg_chain(pony_msg_t* first, pony_msg_t* last)
+{
+  // A message chain is well formed if last is reachable from first and is the
+  // end of the chain. first should also be the start of the chain but we can't
+  // verify that.
+
+  if((first == NULL) || (last == NULL) ||
+    (atomic_load_explicit(&last->next, memory_order_relaxed) != NULL))
+    return false;
+
+  pony_msg_t* m1 = first;
+  pony_msg_t* m2 = first;
+
+  while((m1 != NULL) && (m2 != NULL))
+  {
+    if(m2 == last)
+      return true;
+
+    m2 = atomic_load_explicit(&m2->next, memory_order_relaxed);
+
+    if(m2 == last)
+      return true;
+    if(m2 == NULL)
+      return false;
+
+    m1 = atomic_load_explicit(&m1->next, memory_order_relaxed);
+    m2 = atomic_load_explicit(&m2->next, memory_order_relaxed);
+
+    if(m1 == m2)
+      return false;
+  }
+
+  return false;
+}
+#endif
+
+static void try_gc(pony_ctx_t* ctx, pony_actor_t* actor)
+{
+  if(!ponyint_heap_startgc(&actor->heap
+#ifdef USE_RUNTIMESTATS
+  , actor))
+#else
+  ))
+#endif
+    return;
+
+#ifdef USE_RUNTIMESTATS
+    uint64_t used_cpu = ponyint_sched_cpu_used(ctx);
+    ctx->schedulerstats.misc_cpu += used_cpu;
+#endif
+
+  TRACING_ACTOR_GC_START(actor);
+  TRACING_ACTOR_GC_MARK_START(actor);
+
+  uint64_t num_actor_references = ponyint_actormap_size(&actor->gc.foreign);
+
+  ponyint_gc_mark(ctx);
+
+  if(actor->type->trace != NULL)
+    actor->type->trace(ctx, actor);
+
+  ponyint_mark_done(ctx);
+  TRACING_ACTOR_GC_HEAP_SWEEP_START(actor);
+
+  uint64_t num_actor_references_deleted = num_actor_references - ponyint_actormap_size(&actor->gc.foreign);
+
+  bool gc_threshold_held = ponyint_heap_endgc(&actor->heap,
+    num_actor_references_deleted
+#ifdef USE_RUNTIMESTATS
+  , actor);
+#else
+  );
+#endif
+
+  TRACING_ACTOR_GC_THRESHOLD_CHANGED(actor, gc_threshold_held);
+
+#ifdef USE_RUNTIMESTATS
+    used_cpu = ponyint_sched_cpu_used(ctx);
+    ctx->schedulerstats.actor_gc_sweep_cpu += used_cpu;
+    actor->actorstats.gc_sweep_cpu += used_cpu;
+#endif
+
+  TRACING_ACTOR_GC_HEAP_SWEEP_END(actor);
+  TRACING_ACTOR_GC_SWEEP_END(actor);
+  TRACING_ACTOR_GC_END(actor);
+}
+
+static void maybe_unblock(pony_actor_t* actor)
+{
+  if(has_internal_flag(actor, ACTOR_FLAG_BLOCKED)) {
+    if(has_internal_flag(actor, ACTOR_FLAG_BLOCKED_SENT)) {
+      unset_internal_flag(actor, ACTOR_FLAG_BLOCKED | ACTOR_FLAG_BLOCKED_SENT);
+      ponyint_cycle_unblock(actor);
+    } else {
+      unset_internal_flag(actor, ACTOR_FLAG_BLOCKED);
+    }
+    TRACING_ACTOR_UNBLOCKED(actor);
+  }
+}
+
+static void send_block(pony_actor_t* actor)
+{
+  // We're blocked, send block message.
+  set_internal_flag(actor, ACTOR_FLAG_BLOCKED_SENT);
+  set_internal_flag(actor, ACTOR_FLAG_CD_CONTACTED);
+  ponyint_cycle_block(actor, &actor->gc);
+}
+
+static bool handle_message(pony_ctx_t* ctx, pony_actor_t* actor,
+  pony_msg_t* msg)
+{
+#ifdef USE_RUNTIMESTATS_MESSAGES
+  ctx->schedulerstats.num_inflight_messages--;
+#endif
+
+  switch(msg->id)
+  {
+    case ACTORMSG_ACQUIRE:
+    {
+#ifdef USE_RUNTIMESTATS_MESSAGES
+      ctx->schedulerstats.mem_used_inflight_messages -= sizeof(pony_msgp_t);
+      ctx->schedulerstats.mem_allocated_inflight_messages -= POOL_ALLOC_SIZE(pony_msgp_t);
+#endif
+
+      pony_assert(!ponyint_is_cycle(actor));
+      pony_msgp_t* m = (pony_msgp_t*)msg;
+
+#ifdef USE_RUNTIMESTATS
+      ctx->schedulerstats.mem_used_actors -= (sizeof(actorref_t)
+        + ponyint_objectmap_total_mem_size(&((actorref_t*)m->p)->map));
+      ctx->schedulerstats.mem_allocated_actors -= (POOL_ALLOC_SIZE(actorref_t)
+        + ponyint_objectmap_total_alloc_size(&((actorref_t*)m->p)->map));
+#endif
+
+      if(ponyint_gc_acquire(&actor->gc, (actorref_t*)m->p))
+      {
+        // send unblock if we've sent a block
+        maybe_unblock(actor);
+      }
+
+      return false;
+    }
+
+    case ACTORMSG_RELEASE:
+    {
+#ifdef USE_RUNTIMESTATS_MESSAGES
+      ctx->schedulerstats.mem_used_inflight_messages -= sizeof(pony_msgp_t);
+      ctx->schedulerstats.mem_allocated_inflight_messages -= POOL_ALLOC_SIZE(pony_msgp_t);
+#endif
+
+      pony_assert(!ponyint_is_cycle(actor));
+      pony_msgp_t* m = (pony_msgp_t*)msg;
+
+#ifdef USE_RUNTIMESTATS
+      ctx->schedulerstats.mem_used_actors -= (sizeof(actorref_t)
+        + ponyint_objectmap_total_mem_size(&((actorref_t*)m->p)->map));
+      ctx->schedulerstats.mem_allocated_actors -= (POOL_ALLOC_SIZE(actorref_t)
+        + ponyint_objectmap_total_alloc_size(&((actorref_t*)m->p)->map));
+#endif
+
+      if(ponyint_gc_release(&actor->gc, (actorref_t*)m->p))
+      {
+        // send unblock if we've sent a block
+        maybe_unblock(actor);
+      }
+
+      return false;
+    }
+
+    case ACTORMSG_ACK:
+    {
+#ifdef USE_RUNTIMESTATS_MESSAGES
+      ctx->schedulerstats.mem_used_inflight_messages -= sizeof(pony_msgi_t);
+      ctx->schedulerstats.mem_allocated_inflight_messages -= POOL_ALLOC_SIZE(pony_msgi_t);
+#endif
+
+      pony_assert(ponyint_is_cycle(actor));
+      actor->type->dispatch(ctx, actor, msg);
+      return false;
+    }
+
+    case ACTORMSG_CONF:
+    {
+#ifdef USE_RUNTIMESTATS_MESSAGES
+      ctx->schedulerstats.mem_used_inflight_messages -= sizeof(pony_msgi_t);
+      ctx->schedulerstats.mem_allocated_inflight_messages -= POOL_ALLOC_SIZE(pony_msgi_t);
+#endif
+
+      pony_assert(!ponyint_is_cycle(actor));
+      if(has_internal_flag(actor, ACTOR_FLAG_BLOCKED_SENT))
+      {
+        // We've sent a block message, send confirm.
+        pony_msgi_t* m = (pony_msgi_t*)msg;
+        ponyint_cycle_ack(m->i);
+      }
+
+      return false;
+    }
+
+    case ACTORMSG_ISBLOCKED:
+    {
+#ifdef USE_RUNTIMESTATS_MESSAGES
+      ctx->schedulerstats.mem_used_inflight_messages -= sizeof(pony_msg_t);
+      ctx->schedulerstats.mem_allocated_inflight_messages -= POOL_ALLOC_SIZE(pony_msg_t);
+#endif
+
+      // this actor should not already be marked as pendingdestroy
+      // or else we could end up double freeing it
+      // this assertion is to ensure this invariant is not
+      // accidentally broken due to code changes
+      pony_assert(!ponyint_actor_pendingdestroy(actor));
+
+      pony_assert(!ponyint_is_cycle(actor));
+      if(has_internal_flag(actor, ACTOR_FLAG_BLOCKED)
+        && !has_internal_flag(actor, ACTOR_FLAG_BLOCKED_SENT)
+        && (actor->gc.rc > 0))
+      {
+        // We're blocked, send block message if:
+        // - the actor hasn't already sent one
+        // - the actor aren't a zombie aka rc == 0
+        //
+        // Sending multiple "i'm blocked" messages to the cycle detector
+        // will result in actor potentially being freed more than once.
+        send_block(actor);
+      }
+
+      return false;
+    }
+
+    case ACTORMSG_BLOCK:
+    {
+      // runtimestats messages tracked in cycle detector
+
+      pony_assert(ponyint_is_cycle(actor));
+      actor->type->dispatch(ctx, actor, msg);
+      return false;
+    }
+
+    case ACTORMSG_UNBLOCK:
+    {
+#ifdef USE_RUNTIMESTATS_MESSAGES
+      ctx->schedulerstats.mem_used_inflight_messages -= sizeof(pony_msgp_t);
+      ctx->schedulerstats.mem_allocated_inflight_messages -= POOL_ALLOC_SIZE(pony_msgp_t);
+#endif
+
+      pony_assert(ponyint_is_cycle(actor));
+      actor->type->dispatch(ctx, actor, msg);
+      return false;
+    }
+
+    case ACTORMSG_CHECKBLOCKED:
+    {
+#ifdef USE_RUNTIMESTATS_MESSAGES
+      ctx->schedulerstats.mem_used_inflight_messages -= sizeof(pony_msg_t);
+      ctx->schedulerstats.mem_allocated_inflight_messages -= POOL_ALLOC_SIZE(pony_msg_t);
+#endif
+
+      pony_assert(ponyint_is_cycle(actor));
+      actor->type->dispatch(ctx, actor, msg);
+      return false;
+    }
+
+    default:
+    {
+#ifdef USE_RUNTIMESTATS_MESSAGES
+      ctx->schedulerstats.mem_used_inflight_messages -= POOL_SIZE(msg->index);
+      ctx->schedulerstats.mem_allocated_inflight_messages -= POOL_SIZE(msg->index);
+#endif
+
+      pony_assert(!ponyint_is_cycle(actor));
+      maybe_unblock(actor);
+
+      actor->type->dispatch(ctx, actor, msg);
+
+      return true;
+    }
+  }
+}
+
+// return true if mute occurs
+static bool maybe_should_mute(pony_actor_t* actor)
+{
+  // if we become muted as a result of handling a message, bail out now.
+  // we aren't set to "muted" at this point. setting to muted during a
+  // a behavior can lead to race conditions that might result in a
+  // deadlock.
+  // Given that actor's are not run when they are muted, then when we
+  // started out batch, actor->muted would have been 0. If any of our
+  // message sends would result in the actor being muted, that value will
+  // have changed to greater than 0.
+  //
+  // We will then set the actor to "muted". Once set, any actor sending
+  // a message to it will be also be muted unless said sender is marked
+  // as overloaded.
+  //
+  // The key points here is that:
+  //   1. We can't set the actor to "muted" until after its finished running
+  //   a behavior.
+  //   2. We should bail out from running the actor and return false so that
+  //   it won't be rescheduled.
+  if(actor->muted > 0)
+  {
+    mute_actor(actor);
+    return true;
+  }
+
+  return false;
+}
+
+static bool batch_limit_reached(pony_actor_t* actor)
+{
+  if(!has_sync_flag(actor, ACTOR_SYNC_FLAG_OVERLOADED))
+  {
+    // If we hit our batch size, consider this actor to be overloaded.
+    // Overloaded actors are allowed to send to other overloaded actors
+    // and to muted actors without being muted themselves.
+    actor_setoverloaded(actor);
+  }
+
+  actor->batch_size += PONY_SCHED_BATCH_STEP;
+  TRACING_ACTOR_BATCH_SIZE_CHANGED(actor);
+
+  return true;
+}
+
+bool ponyint_actor_run(pony_ctx_t* ctx, pony_actor_t* actor)
+{
+  TRACING_THREAD_ACTOR_RUN_START(actor);
+  pony_assert(!has_sync_flag(actor, ACTOR_SYNC_FLAG_MUTED));
+  ctx->current = actor;
+  actor->sent_to_overloaded = false;
+  size_t batch = actor->batch_size;
+
+  pony_msg_t* msg;
+  size_t app = 0;
+
+
+  // check to see at the start of a run, and most importantly, the first time
+  // we run if our GC is over 0. If it is 0 the first time we run, then the
+  // actor starts as an orphan with no references to it. There is no way that
+  // the cycle detector will find out about an orphan actor unless it either
+  // contacts the cycle detector itself (which we don't do) or the orphan
+  // contacts another and needs to participate in the cycle detection protocol.
+  // if an actors rc never goes above 0, it will be able to safely delete itself
+  // even in the presence of the cycle detector.
+  if (!actor_noblock && actor->gc.rc > 0)
+    set_internal_flag(actor, ACTOR_FLAG_RC_OVER_ZERO_SEEN);
+
+  // If we have been scheduled, the head will not be marked as empty.
+  pony_msg_t* head = atomic_load_explicit(&actor->q.head, memory_order_acquire);
+
+  while((msg = ponyint_actor_messageq_pop(&actor->q)) != NULL)
+  {
+#ifdef USE_RUNTIMESTATS
+    uint64_t used_cpu = ponyint_sched_cpu_used(ctx);
+    ctx->schedulerstats.misc_cpu += used_cpu;
+#endif
+
+    TRACING_ACTOR_BEHAVIOR_RUN_START(actor, msg, msg->id);
+    bool app_msg = handle_message(ctx, actor, msg);
+    TRACING_ACTOR_BEHAVIOR_RUN_END(actor, msg, msg->id);
+
+    // if an actors rc never goes above 0, it will be able to safely delete
+    // itself even in the presence of the cycle detector. This is one of two
+    // checks to see if that invariant is in place for a given actor.
+    if (!actor_noblock && actor->gc.rc > 0)
+      set_internal_flag(actor, ACTOR_FLAG_RC_OVER_ZERO_SEEN);
+
+#ifdef USE_RUNTIMESTATS
+    used_cpu = ponyint_sched_cpu_used(ctx);
+#endif
+
+    if(app_msg)
+    {
+#ifdef USE_RUNTIMESTATS
+      ctx->schedulerstats.actor_app_cpu += used_cpu;
+      actor->actorstats.app_cpu += used_cpu;
+      actor->actorstats.app_messages_processed_counter++;
+#endif
+
+      // If we handle an application message, try to gc.
+      app++;
+      try_gc(ctx, actor);
+
+      // maybe mute actor; returns true if mute occurs
+      if(maybe_should_mute(actor))
+      {
+        TRACING_THREAD_ACTOR_RUN_STOP(actor);
+        return false;
+      }
+
+      // if we've reached our batch limit
+      if(app == batch)
+      {
+        TRACING_THREAD_ACTOR_RUN_STOP(actor);
+        return batch_limit_reached(actor);
+      }
+    }
+    else
+    {
+#ifdef USE_RUNTIMESTATS
+      ctx->schedulerstats.actor_system_cpu += used_cpu;
+      actor->actorstats.system_cpu += used_cpu;
+      actor->actorstats.system_messages_processed_counter++;
+#endif
+    }
+
+    // Stop handling a batch if we reach the head we found when we were
+    // scheduled.
+    if(msg == head)
+      break;
+  }
+
+  // We didn't hit our app message batch limit. We now believe our queue to be
+  // empty, but we may have received further messages.
+  pony_assert(app < batch);
+  pony_assert(!has_sync_flag(actor, ACTOR_SYNC_FLAG_MUTED));
+
+  if(has_sync_flag(actor, ACTOR_SYNC_FLAG_OVERLOADED))
+  {
+    // if we were overloaded and didn't process a full batch, set ourselves as
+    // no longer overloaded. Once this is done:
+    // 1- sending to this actor is no longer grounds for an actor being muted
+    // 2- this actor can no longer send to other actors free from muting should
+    //    the receiver be overloaded or muted
+    actor_unsetoverloaded(actor);
+  }
+
+  if(!actor->sent_to_overloaded && actor->batch_size < PONY_SCHED_BATCH)
+  {
+    actor->batch_size += PONY_SCHED_BATCH_STEP;
+    if(actor->batch_size > PONY_SCHED_BATCH)
+      actor->batch_size = PONY_SCHED_BATCH;
+    TRACING_ACTOR_BATCH_SIZE_CHANGED(actor);
+  }
+
+  try_gc(ctx, actor);
+
+  // If we have processed any application level messages, defer blocking.
+  if(app > 0)
+  {
+    TRACING_THREAD_ACTOR_RUN_STOP(actor);
+    return true;
+  }
+
+  // note that we're logically blocked
+  if(!has_internal_flag(actor, ACTOR_FLAG_BLOCKED | ACTOR_FLAG_SYSTEM | ACTOR_FLAG_BLOCKED_SENT))
+  {
+    set_internal_flag(actor, ACTOR_FLAG_BLOCKED);
+    TRACING_ACTOR_BLOCKED(actor);
+  }
+
+  if (has_internal_flag(actor, ACTOR_FLAG_BLOCKED))
+  {
+    if (actor->gc.rc == 0)
+    {
+      pony_assert(actor->live_asio_events == 0);
+      // Here, we is what we know to be true:
+      //
+      // - the actor is blocked
+      // - the actor likely has no messages in its queue
+      // - there's no references to this actor
+      //
+
+      if (actor_noblock || !has_internal_flag(actor, ACTOR_FLAG_RC_OVER_ZERO_SEEN))
+      {
+        // When 'actor_noblock` is true, the cycle detector isn't running.
+        // this means actors won't be garbage collected unless we take special
+        // action. Therefore if `noblock` is on, we should garbage collect the
+        // actor
+        //
+        // When the cycle detector is running, it is still safe to locally
+        // delete if our RC has never been above 0 because the cycle detector
+        // can't possibly know about the actor's existence so, if it's message
+        // queue is empty, doing a local delete is safe.
+        if(ponyint_messageq_isempty(&actor->q))
+        {
+          // The actors queue is empty which means this actor is a zombie
+          // and can be reaped.
+
+          // mark the queue as empty or else destroy will hang
+          bool empty = ponyint_messageq_markempty(&actor->q);
+
+          // make sure the queue is actually empty as expected
+          pony_assert(empty);
+
+          TRACING_THREAD_ACTOR_RUN_STOP(actor);
+
+          // "Locally delete" the actor.
+          ponyint_actor_setpendingdestroy(actor);
+          ponyint_actor_final(ctx, actor);
+          ponyint_actor_sendrelease(ctx, actor);
+          ponyint_actor_destroy(actor, ACTOR_DESTROYED_FAST_REAP);
+
+          // make sure the scheduler will not reschedule this actor
+          return !empty;
+        }
+      } else {
+        // Tell cycle detector that this actor is a zombie and will not get
+        // any more messages/work and can be reaped.
+        // Mark the actor as ACTOR_FLAG_BLOCKED_SENT and send a BLOCKED message
+        // to speed up reaping otherwise waiting for the cycle detector
+        // to get around to asking if we're blocked could result in
+        // unnecessary memory growth.
+        //
+        // We're blocked, send block message telling the cycle detector
+        // to reap this actor (because its `rc == 0`).
+        // This is concurrency safe because, only the cycle detector might
+        // have a reference to this actor (rc is 0) so another actor can not
+        // send it an application message that results this actor becoming
+        // unblocked (which would create a race condition).
+        send_block(actor);
+
+        TRACING_THREAD_ACTOR_RUN_STOP(actor);
+
+        // We have to ensure that this actor will not be rescheduled if the
+        // cycle detector happens to send it a message.
+        //
+        // intentionally don't mark the queue as empty because we don't want
+        // this actor to be rescheduled if the cycle detector sends it a message
+        //
+        // make sure the scheduler will not reschedule this actor
+        return false;
+      }
+    } else {
+      // rc is greater than 0 which means other actors have references to us
+      // preventing us from being destroyed.
+
+      // Force GC to run because we're blocked and our rc is greater than 0.
+      // This will try and free any memory the actor has in its heap along with
+      // references to other actors that have been deleted. This could result
+      // in other actors being unblocked and/or destroyed which could eventually
+      // result in our rc going to 0 so we can be also be destroyed.
+      // This is only safe to do if we have not sent a block message to the
+      // cycle detector because the cycle detector could concurrently reap us
+      // if we have and then we could have use-after-free issues.
+      if (actor_noblock || !has_internal_flag(actor, ACTOR_FLAG_BLOCKED_SENT))
+      {
+        pony_triggergc(ctx);
+        try_gc(ctx, actor);
+      }
+
+      if (!actor_noblock && !has_internal_flag(actor, ACTOR_FLAG_CD_CONTACTED))
+      {
+        // The cycle detector is running and we've never contacted it ourselves,
+        // so let it know we exist in case it is unaware.
+        send_block(actor);
+      }
+    }
+  }
+
+  TRACING_THREAD_ACTOR_RUN_STOP(actor);
+
+  // If we mark the queue as empty, then it is no longer safe to do any
+  // operations on this actor that aren't concurrency safe so make
+  // `ponyint_messageq_markempty` the last thing we do.
+  // Return true (i.e. reschedule immediately) if our queue isn't empty.
+  return !ponyint_messageq_markempty(&actor->q);
+}
+
+void ponyint_actor_destroy(pony_actor_t* actor, actor_destroyed_reason_t reason)
+{
+  pony_assert(has_sync_flag(actor, ACTOR_SYNC_FLAG_PENDINGDESTROY));
+
+  // Make sure the actor being destroyed has finished marking its queue
+  // as empty. Otherwise, it may spuriously see that tail and head are not
+  // the same and fail to mark the queue as empty, resulting in it getting
+  // rescheduled.
+  pony_msg_t* head = NULL;
+  do
+  {
+    head = atomic_load_explicit(&actor->q.head, memory_order_relaxed);
+  } while(((uintptr_t)head & (uintptr_t)1) != (uintptr_t)1);
+
+  atomic_thread_fence(memory_order_acquire);
+#ifdef USE_VALGRIND
+  ANNOTATE_HAPPENS_AFTER(&actor->q.head);
+#endif
+
+  ponyint_messageq_destroy(&actor->q, false);
+  ponyint_gc_destroy(&actor->gc);
+  ponyint_heap_destroy(&actor->heap);
+
+#ifdef USE_RUNTIMESTATS
+  pony_ctx_t* ctx = pony_ctx();
+  ctx->schedulerstats.mem_used_actors -= actor->type->size;
+  ctx->schedulerstats.mem_allocated_actors -= ponyint_pool_used_size(actor->type->size);
+  ctx->schedulerstats.destroyed_actors_counter++;
+  if (ponyint_sched_print_stats())
+    print_actor_stats(actor);
+#endif
+
+  (void)reason;
+  TRACING_ACTOR_DESTROYED(actor, reason);
+
+  // Free variable sized actors correctly.
+  ponyint_pool_free_size(actor->type->size, actor);
+}
+
+gc_t* ponyint_actor_gc(pony_actor_t* actor)
+{
+  return &actor->gc;
+}
+
+heap_t* ponyint_actor_heap(pony_actor_t* actor)
+{
+  return &actor->heap;
+}
+
+bool ponyint_actor_pendingdestroy(pony_actor_t* actor)
+{
+  return has_sync_flag(actor, ACTOR_SYNC_FLAG_PENDINGDESTROY);
+}
+
+void ponyint_actor_setpendingdestroy(pony_actor_t* actor)
+{
+  // This is thread-safe, even though the flag is set from the cycle detector.
+  // The function is only called after the cycle detector has detected a true
+  // cycle and an actor won't change its flags if it is part of a true cycle.
+  // The synchronisation is done through the ACK message sent by the actor to
+  // the cycle detector.
+  set_sync_flag(actor, ACTOR_SYNC_FLAG_PENDINGDESTROY);
+}
+
+void ponyint_actor_final(pony_ctx_t* ctx, pony_actor_t* actor)
+{
+  // This gets run while the cycle detector is handling a message. Set the
+  // current actor before running anything.
+  pony_actor_t* prev = ctx->current;
+  ctx->current = actor;
+
+  // Run the actor finaliser if it has one.
+  if(actor->type->final != NULL)
+    actor->type->final(actor);
+
+  // Run all outstanding object finalisers.
+  ponyint_heap_final(&actor->heap);
+
+  // Restore the current actor.
+  ctx->current = prev;
+}
+
+void ponyint_actor_sendrelease(pony_ctx_t* ctx, pony_actor_t* actor)
+{
+  ponyint_gc_sendrelease(ctx, &actor->gc);
+}
+
+void ponyint_actor_setsystem(pony_actor_t* actor)
+{
+  set_internal_flag(actor, ACTOR_FLAG_SYSTEM);
+}
+
+void ponyint_actor_setnoblock(bool state)
+{
+  actor_noblock = state;
+}
+
+bool ponyint_actor_getnoblock()
+{
+  return actor_noblock;
+}
+
+PONY_API pony_actor_t* pony_create(pony_ctx_t* ctx, pony_type_t* type,
+  bool orphaned)
+{
+  pony_assert(type != NULL);
+
+  // allocate variable sized actors correctly
+  pony_actor_t* actor = (pony_actor_t*)ponyint_pool_alloc_size(type->size);
+  memset(actor, 0, type->size);
+  actor->type = type;
+
+#ifdef USE_SYSTEMATIC_TESTING
+  // Assign a stable, monotonic creation-order id (ids start at 1; 0 is never a
+  // valid actor id). Used to order otherwise pointer-ordered scheduling
+  // decisions deterministically (see pony_actor_t.systematic_testing_id).
+  actor->systematic_testing_id =
+    atomic_fetch_add_explicit(&actor_systematic_testing_id_counter, 1,
+      memory_order_relaxed) + 1;
+#endif
+
+#ifdef USE_RUNTIMESTATS
+  ctx->schedulerstats.mem_used_actors += type->size;
+  ctx->schedulerstats.mem_allocated_actors += ponyint_pool_used_size(type->size);
+  ctx->schedulerstats.created_actors_counter++;
+#endif
+
+  ponyint_messageq_init(&actor->q);
+  ponyint_heap_init(&actor->heap);
+  ponyint_gc_done(&actor->gc);
+  actor->batch_size = PONY_SCHED_BATCH;
+
+  if(ctx->current != NULL && !orphaned)
+  {
+    // Do not set an rc if the actor is orphaned. The compiler determined that
+    // there are no references to this actor. By not setting a non-zero RC, we
+    // will GC the actor sooner and lower overall memory usage.
+    actor->gc.rc = GC_INC_MORE;
+    ponyint_gc_createactor(ctx->current, actor);
+  } else {
+    // no creator, so the actor isn't referenced by anything
+    actor->gc.rc = 0;
+  }
+
+  TRACING_ACTOR_CREATED(actor);
+  return actor;
+}
+
+// this is currently only used for two purposes:
+// * to destroy the cycle detector
+// * to destroy the temporary actor created to run primitive finalisers
+//   that happens after the schedulers have exited and the cycle detector
+//   has been destroyed
+//
+// as a result, this does not need to be concurrency safe
+// or tell the cycle detector of what it is doing
+PONY_API void ponyint_destroy(pony_actor_t* actor)
+{
+  // This destroys an actor immediately.
+  // The finaliser is not called.
+
+  ponyint_actor_setpendingdestroy(actor);
+  ponyint_actor_destroy(actor, ACTOR_DESTROYED_MANUAL);
+}
+
+PONY_API pony_msg_t* pony_alloc_msg(uint32_t index, uint32_t id)
+{
+#ifdef USE_RUNTIMESTATS
+  pony_ctx_t* ctx = pony_ctx();
+  if(ctx->current)
+    ctx->current->actorstats.messages_sent_counter++;
+#endif
+#ifdef USE_RUNTIMESTATS_MESSAGES
+  ctx->schedulerstats.mem_used_inflight_messages += POOL_SIZE(index);
+  ctx->schedulerstats.mem_allocated_inflight_messages += POOL_SIZE(index);
+  ctx->schedulerstats.num_inflight_messages++;
+#endif
+
+  pony_msg_t* msg = (pony_msg_t*)ponyint_pool_alloc(index);
+  msg->index = index;
+  msg->id = id;
+  // Null a fresh message's link so well_formed_msg_chain sees a clean chain
+  // end. Gated with that check, not just on debug, so it holds in a
+  // release-safe build too.
+#if !defined(PONY_NDEBUG) || defined(PONY_ALWAYS_ASSERT)
+  atomic_store_explicit(&msg->next, NULL, memory_order_relaxed);
+#endif
+
+  return msg;
+}
+
+PONY_API void pony_sendv(pony_ctx_t* ctx, pony_actor_t* to, pony_msg_t* first,
+  pony_msg_t* last, bool has_app_msg)
+{
+  // The function takes a prebuilt chain instead of varargs because the latter
+  // is expensive and very hard to optimise.
+
+  if(ponyint_tracing_enabled)
+  {
+    pony_msg_t* m = first;
+
+    while(m != last)
+    {
+      ponyint_tracing_actor_behavior_run_schedule(ctx->current, to, m, m->id);
+      m = atomic_load_explicit(&m->next, memory_order_relaxed);
+    }
+
+    ponyint_tracing_actor_behavior_run_schedule(ctx->current, to, m, m->id);
+  }
+
+  pony_assert(well_formed_msg_chain(first, last));
+
+  // Make sure we're not trying to send a message to an actor that is about
+  // to be destroyed.
+  pony_assert(!ponyint_actor_pendingdestroy(to));
+
+  if(has_app_msg)
+    maybe_mark_should_mute(ctx, to);
+
+  if(ponyint_actor_messageq_push(&to->q, first, last))
+  {
+    if(!has_sync_flag(to, ACTOR_SYNC_FLAG_MUTED))
+    {
+      ponyint_sched_add(ctx, to);
+    }
+  }
+}
+
+PONY_API void pony_sendv_single(pony_ctx_t* ctx, pony_actor_t* to,
+  pony_msg_t* first, pony_msg_t* last, bool has_app_msg)
+{
+  // The function takes a prebuilt chain instead of varargs because the latter
+  // is expensive and very hard to optimise.
+
+  if(ponyint_tracing_enabled)
+  {
+    pony_msg_t* m = first;
+
+    while(m != last)
+    {
+      ponyint_tracing_actor_behavior_run_schedule(ctx->current, to, m, m->id);
+      m = atomic_load_explicit(&m->next, memory_order_relaxed);
+    }
+
+    ponyint_tracing_actor_behavior_run_schedule(ctx->current, to, m, m->id);
+  }
+
+  pony_assert(well_formed_msg_chain(first, last));
+
+  // make sure we're not trying to send a message to an actor
+  // that is about to be destroyed
+  pony_assert(!ponyint_actor_pendingdestroy(to));
+
+  if(has_app_msg)
+    maybe_mark_should_mute(ctx, to);
+
+  if(ponyint_actor_messageq_push_single(&to->q, first, last))
+  {
+    if(!has_sync_flag(to, ACTOR_SYNC_FLAG_MUTED))
+    {
+      // if the receiving actor is currently not unscheduled AND it's not
+      // muted, schedule it.
+      ponyint_sched_add(ctx, to);
+    }
+  }
+}
+
+PONY_API void pony_chain(pony_msg_t* prev, pony_msg_t* next)
+{
+  pony_assert(atomic_load_explicit(&prev->next, memory_order_relaxed) == NULL);
+  atomic_store_explicit(&prev->next, next, memory_order_relaxed);
+}
+
+void ponyint_send(pony_ctx_t* ctx, pony_actor_t* to, uint32_t id)
+{
+#ifdef USE_RUNTIMESTATS_MESSAGES
+  ctx->schedulerstats.mem_used_inflight_messages += sizeof(pony_msg_t);
+  ctx->schedulerstats.mem_used_inflight_messages -= POOL_ALLOC_SIZE(pony_msg_t);
+#endif
+
+  pony_msg_t* m = pony_alloc_msg(POOL_INDEX(sizeof(pony_msg_t)), id);
+  pony_sendv(ctx, to, m, m, id <= ACTORMSG_APPLICATION_START);
+}
+
+void ponyint_sendp(pony_ctx_t* ctx, pony_actor_t* to, uint32_t id, void* p)
+{
+#ifdef USE_RUNTIMESTATS_MESSAGES
+  ctx->schedulerstats.mem_used_inflight_messages += sizeof(pony_msgp_t);
+  ctx->schedulerstats.mem_used_inflight_messages -= POOL_ALLOC_SIZE(pony_msgp_t);
+#endif
+
+  pony_msgp_t* m = (pony_msgp_t*)pony_alloc_msg(
+    POOL_INDEX(sizeof(pony_msgp_t)), id);
+  m->p = p;
+
+  pony_sendv(ctx, to, &m->msg, &m->msg, id <= ACTORMSG_APPLICATION_START);
+}
+
+void ponyint_sendi(pony_ctx_t* ctx, pony_actor_t* to, uint32_t id, intptr_t i)
+{
+#ifdef USE_RUNTIMESTATS_MESSAGES
+  ctx->schedulerstats.mem_used_inflight_messages += sizeof(pony_msgi_t);
+  ctx->schedulerstats.mem_used_inflight_messages -= POOL_ALLOC_SIZE(pony_msgi_t);
+#endif
+
+  pony_msgi_t* m = (pony_msgi_t*)pony_alloc_msg(
+    POOL_INDEX(sizeof(pony_msgi_t)), id);
+  m->i = i;
+
+  pony_sendv(ctx, to, &m->msg, &m->msg, id <= ACTORMSG_APPLICATION_START);
+}
+
+void ponyint_sendv_inject(pony_actor_t* to, pony_msg_t* msg)
+{
+  // Make sure we're not trying to send a message to an actor that is about
+  // to be destroyed.
+
+  pony_ctx_t* ctx = pony_ctx();
+
+  TRACING_ACTOR_BEHAVIOR_RUN_SCHEDULE(ctx->current, to, msg, msg->id);
+
+  pony_assert(!ponyint_actor_pendingdestroy(to));
+
+  if(ponyint_actor_messageq_push(&to->q, msg, msg))
+  {
+    if(!has_sync_flag(to, ACTOR_SYNC_FLAG_MUTED))
+    {
+      ponyint_sched_add_inject(to);
+    }
+  }
+
+  (void)ctx;
+}
+
+void ponyint_send_inject(pony_actor_t* to, uint32_t id)
+{
+  pony_msg_t* m = pony_alloc_msg(POOL_INDEX(sizeof(pony_msg_t)), id);
+  ponyint_sendv_inject(to, m);
+}
+
+void ponyint_sendp_inject(pony_actor_t* to, uint32_t id, void* p)
+{
+  pony_msgp_t* m = (pony_msgp_t*)pony_alloc_msg(
+    POOL_INDEX(sizeof(pony_msgp_t)), id);
+  m->p = p;
+
+  ponyint_sendv_inject(to, &m->msg);
+}
+
+void ponyint_sendi_inject(pony_actor_t* to, uint32_t id, intptr_t i)
+{
+  pony_msgi_t* m = (pony_msgi_t*)pony_alloc_msg(
+    POOL_INDEX(sizeof(pony_msgi_t)), id);
+  m->i = i;
+
+  ponyint_sendv_inject(to, &m->msg);
+}
+
+// HeapToStack (libponylto) matches pony_alloc and pony_alloc_small by name
+// at call sites to promote heap allocations to the stack. With -O2 bitcode
+// the CGSCC inliner would inline these before HeapToStack runs, removing the
+// call sites HeapToStack needs. noinline preserves them through the inliner;
+// InlineRemainingAllocPass (plugin.cc) strips it afterward and inlines the
+// surviving calls.
+PONY_API PONY_NOINLINE
+void* pony_alloc(pony_ctx_t* ctx, size_t size)
+{
+  pony_assert(ctx->current != NULL);
+
+  return ponyint_heap_alloc(ctx->current, &ctx->current->heap, size,
+    TRACK_NO_FINALISERS);
+}
+
+PONY_API PONY_NOINLINE
+void* pony_alloc_small(pony_ctx_t* ctx, uint32_t sizeclass)
+{
+  pony_assert(ctx->current != NULL);
+
+  return ponyint_heap_alloc_small(ctx->current, &ctx->current->heap, sizeclass,
+    TRACK_NO_FINALISERS);
+}
+
+PONY_API void* pony_alloc_large(pony_ctx_t* ctx, size_t size)
+{
+  pony_assert(ctx->current != NULL);
+
+  return ponyint_heap_alloc_large(ctx->current, &ctx->current->heap, size,
+    TRACK_NO_FINALISERS);
+}
+
+PONY_API void* pony_realloc(pony_ctx_t* ctx, void* p, size_t size, size_t copy)
+{
+  pony_assert(ctx->current != NULL);
+
+  return ponyint_heap_realloc(ctx->current, &ctx->current->heap, p, size, copy);
+}
+
+PONY_API void* pony_alloc_final(pony_ctx_t* ctx, size_t size)
+{
+  pony_assert(ctx->current != NULL);
+
+  return ponyint_heap_alloc(ctx->current, &ctx->current->heap, size,
+    TRACK_ALL_FINALISERS);
+}
+
+PONY_API void* pony_alloc_small_final(pony_ctx_t* ctx, uint32_t sizeclass)
+{
+  pony_assert(ctx->current != NULL);
+
+  return ponyint_heap_alloc_small(ctx->current, &ctx->current->heap,
+    sizeclass, TRACK_ALL_FINALISERS);
+}
+
+PONY_API void* pony_alloc_large_final(pony_ctx_t* ctx, size_t size)
+{
+  pony_assert(ctx->current != NULL);
+
+  return ponyint_heap_alloc_large(ctx->current, &ctx->current->heap,
+    size, TRACK_ALL_FINALISERS);
+}
+
+PONY_API void pony_triggergc(pony_ctx_t* ctx)
+{
+  pony_assert(ctx->current != NULL);
+  ctx->current->heap.next_gc = 0;
+}
+
+bool ponyint_actor_is_pinned(pony_actor_t* actor)
+{
+  return has_internal_flag(actor, ACTOR_FLAG_PINNED);
+}
+
+PONY_API void pony_actor_set_pinned()
+{
+  pony_ctx_t* ctx = pony_ctx();
+  set_internal_flag(ctx->current, ACTOR_FLAG_PINNED);
+}
+
+PONY_API void pony_actor_unset_pinned()
+{
+  pony_ctx_t* ctx = pony_ctx();
+  unset_internal_flag(ctx->current, ACTOR_FLAG_PINNED);
+}
+
+void ponyint_become(pony_ctx_t* ctx, pony_actor_t* actor)
+{
+  ctx->current = actor;
+}
+
+void ponyint_cycle_detector_enable_tracing(pony_actor_t* actor)
+{
+  pony_assert(ponyint_is_cycle(actor));
+  set_internal_flag(actor, ACTOR_FLAG_TRACE);
+  TRACING_ACTOR_TRACING_ENABLED(actor);
+}
+
+bool ponyint_actor_tracing_enabled(pony_actor_t* actor)
+{
+  return has_internal_flag(actor, ACTOR_FLAG_TRACE);
+}
+
+void ponyint_actor_enable_tracing()
+{
+  pony_actor_t* actor = pony_ctx()->current;
+  set_internal_flag(actor, ACTOR_FLAG_TRACE);
+  TRACING_ACTOR_TRACING_ENABLED(actor);
+}
+
+void ponyint_actor_disable_tracing()
+{
+  pony_actor_t* actor = pony_ctx()->current;
+  unset_internal_flag(actor, ACTOR_FLAG_TRACE);
+  TRACING_ACTOR_TRACING_DISABLED(actor);
+}
+
+PONY_API void pony_apply_backpressure()
+{
+  pony_ctx_t* ctx = pony_ctx();
+  set_sync_flag(ctx->current, ACTOR_SYNC_FLAG_UNDER_PRESSURE);
+  TRACING_ACTOR_UNDERPRESSURE(ctx->current);
+}
+
+PONY_API void pony_release_backpressure()
+{
+  pony_ctx_t* ctx = pony_ctx();
+  unset_sync_flag(ctx->current, ACTOR_SYNC_FLAG_UNDER_PRESSURE);
+  TRACING_ACTOR_NOTUNDERPRESSURE(ctx->current);
+  if (!has_sync_flag(ctx->current, ACTOR_SYNC_FLAG_OVERLOADED))
+    ponyint_sched_start_global_unmute(ctx->scheduler->index, ctx->current);
+}
+
+PONY_API actorstats_t* pony_actor_stats()
+{
+#ifdef USE_RUNTIMESTATS
+  pony_ctx_t* ctx = pony_ctx();
+  return &ctx->current->actorstats;
+#else
+  return NULL;
+#endif
+}
+
+#ifdef USE_RUNTIMESTATS
+size_t ponyint_actor_mem_size(pony_actor_t* actor)
+{
+  return actor->type->size;
+}
+
+size_t ponyint_actor_alloc_size(pony_actor_t* actor)
+{
+  return ponyint_pool_used_size(actor->type->size);
+}
+
+size_t ponyint_actor_total_mem_size(pony_actor_t* actor)
+{
+  // memeory categories:
+  //   used - memory allocated that is actively being used by the runtime
+  return
+      // actor struct size (maybe this shouldn't be counted to avoid double
+      // counting since it is counted as part of the scheduler thread mem used?)
+      actor->type->size
+      // cycle detector memory used (or 0 if not cycle detector)
+    + ( ponyint_is_cycle(actor) ? ponyint_cycle_mem_size() : 0)
+      // actor heap memory used
+    + ponyint_heap_mem_size(actor)
+      // actor gc total memory used
+    + ponyint_gc_total_mem_size(actor, &actor->gc)
+      // size of stub message when message_q is initialized
+    + sizeof(pony_msg_t);
+}
+
+size_t ponyint_actor_total_alloc_size(pony_actor_t* actor)
+{
+  // memeory categories:
+  //   alloc - memory allocated whether it is actively being used or not
+  return
+      // allocation for actor struct size (maybe this shouldn't be counted to
+      // avoid double counting since it is counted as part of the scheduler
+      // thread mem allocated?)
+      ponyint_pool_used_size(actor->type->size)
+      // cycle detector memory allocated (or 0 if not cycle detector)
+    + ( ponyint_is_cycle(actor) ? ponyint_cycle_alloc_size() : 0)
+      // actor heap memory allocated
+    + ponyint_heap_alloc_size(actor)
+      // actor gc total memory allocated
+    + ponyint_gc_total_alloc_size(actor, &actor->gc)
+      // allocation of stub message when message_q is initialized
+    + POOL_ALLOC_SIZE(pony_msg_t);
+}
+#endif
+
+PONY_EXTERN_C_END

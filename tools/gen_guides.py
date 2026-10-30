@@ -46,6 +46,7 @@ GUIDES = [
     ("07-rad-thread-pool-arenas", "RAD · Thread-pool arenas"),
     ("08-verified-handle-map", "Verified handle map"),
     ("09-verus-handle-map", "Verus handle map"),
+    ("10-pony-actors", "Pony · Actor allocators"),
 ]
 
 CSS = """

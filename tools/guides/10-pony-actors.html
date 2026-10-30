@@ -1,0 +1,171 @@
+<h1>Pony's actor allocators in Rust</h1>
+<p class="lede"><a href="https://www.ponylang.io">Pony</a> gives every actor a private heap and passes objects between actors by reference, without copying and without locks. This crate rebuilds the allocators behind that, from Pony's C runtime (<code>ponyc/src/libponyrt</code>, commit <code>cc2ec5d</code>), on Rust's stable <code>Allocator</code> trait: a size-class pool owned per thread, a heap per actor, <code>iso</code>/<code>val</code>/<code>tag</code> as types, a lock-free mailbox, and a small scheduler to drive them.</p>
+
+<h2 id="idea">1. The idea</h2>
+<p>An actor is a state, a mailbox and a heap, run by one thread at a time. Objects it allocates live in its heap. When it sends one to another actor, it sends the pointer. The object is freed later, by its owner, when nobody holds it any more.</p>
+<div class="diagram"><pre>
+ thread A (worker 0)                              thread B (worker 1)
+ ┌ Producer actor ───────────────┐               ┌ Consumer actor ────────────┐
+ │ heap (Local): free lists      │  send(Iso)    │                            │
+ │   buf = Iso::new_in(.., heap) │ ────────────▶ │ mailbox ◀ pool-allocated   │
+ │                               │   pointer     │   message node             │
+ │ remote list ◀───────────────────────────────── drop(buf): remote free      │
+ │   collect() after each batch  │   one CAS     │                            │
+ └───────────────────────────────┘               └────────────────────────────┘
+ pool (per thread): message nodes freed on B go back to A's inbox, 32 at a time
+</pre></div>
+<p>Two different "owners" are involved, just as in Pony: a <b>heap block</b> belongs to an <em>actor</em>, and a <b>pool block</b> (messages, chunks) belongs to the <em>thread</em> that carved it. Both are freed by whoever drops them and sent home to their owner in batches.</p>
+
+<h2 id="layers">2. Pony's memory, layer by layer</h2>
+<table>
+<tr><th>Pony (C)</th><th>What it does</th><th>Here</th></tr>
+<tr><td><code>mem/pool_arena.c</code></td><td>Size classes 32 B–1 MiB. Slabs owned by a thread. Frees of another thread's blocks are chained and pushed to the owner's inbox, 32 per CAS.</td><td><code>Pool</code> (32 B–4 KiB)</td></tr>
+<tr><td><code>mem/heap.c</code></td><td>One heap per actor. Small objects (32–512 B) in 1 KiB chunks, large ones as pool blocks. Freed only by its actor, during GC between behaviours.</td><td><code>Local</code> / <code>Remote</code></td></tr>
+<tr><td><code>mem/pagemap.c</code></td><td>Maps any address to its chunk and owning actor, for GC.</td><td>Not needed: the owner travels with the object (<code>Remote</code>)</td></tr>
+<tr><td>reference capabilities</td><td><code>iso</code> moves, <code>val</code> is shared immutable, <code>tag</code> can only send.</td><td><code>Iso&lt;T&gt;</code>, <code>Val&lt;T&gt;</code>, <code>Addr&lt;M&gt;</code></td></tr>
+<tr><td><code>actor/messageq.c</code></td><td>Intrusive MPSC queue; bit 0 of <code>head</code> means "empty and not scheduled".</td><td><code>Mailbox&lt;M&gt;</code></td></tr>
+<tr><td><code>actor/actor.c</code></td><td>Run up to 100 messages, GC, mark empty or reschedule.</td><td><code>System</code>, <code>Actor</code></td></tr>
+<tr><td><code>gc/*.c</code> (ORCA), <code>gc/cycle.c</code></td><td>Reference counts for objects shared between actors, carried on messages; collecting dead actors.</td><td>Replaced by Rust ownership (section 9)</td></tr>
+</table>
+
+<h2 id="pool">3. The pool: blocks owned by threads</h2>
+<h3>C</h3>
+<p>Pony's pool has a thread cache, slabs inside 8 MiB arenas inside 256 MiB regions, and a long comment file (<code>original/POOL_ARENA.md</code>). The core is short. Allocation tries the cache, then the current slab, then the inbox of blocks other threads freed, then new memory:</p>
+{{c-item original/pool_arena.c void* ponyint_pool_alloc(size_t index)}}
+<p>Freeing finds the arena by masking the address (<code>arena_of</code>) and checks who owns it. Another thread's block is never put on this thread's lists; it goes onto a chain for its owner:</p>
+{{c-item original/pool_arena.c void ponyint_pool_free(size_t index, void* p)}}
+{{c-item original/pool_arena.c static void chain_push(uint32_t owner, void* p)}}
+<p>The owner takes its whole inbox with one atomic swap:</p>
+{{c-item original/pool_arena.c static void inbox_drain()}}
+<h3>Rust</h3>
+<p>Same structure, much smaller: classes 32 B to 4 KiB, and each slab is one 64 KiB, 64 KiB-aligned block from <code>Global</code> holding one class. Its first bytes hold the owner, so <code>addr &amp; !(SLAB_SIZE - 1)</code> finds it, like <code>arena_of</code>.</p>
+{{rs-item src/pool.rs fn header_of(}}
+{{rs-item src/pool.rs fn alloc(&mut self, class: usize)}}
+{{rs-item src/pool.rs fn free(&mut self, p: *mut u8, class: usize)}}
+{{rs-item src/pool.rs unsafe fn push_inbox(}}
+{{rs-item src/pool.rs fn drain_inbox(}}
+<p>The per-thread state lives in a <code>thread_local!</code>, so <code>Pool</code> itself is a zero-sized, <code>Copy</code> handle usable from any thread:</p>
+{{rs-item src/pool.rs unsafe impl Allocator for Pool}}
+<table>
+<tr><th></th><th>Pony</th><th>Rust</th></tr>
+<tr><td>Find the owner of a block</td><td><code>p &amp; ~ARENA_MASK</code></td><td><code>with_exposed_provenance(p.addr() &amp; !MASK)</code>; the slab's provenance is exposed when it is made</td></tr>
+<tr><td>Size on free</td><td>Size-class index passed by the caller</td><td>From the <code>Layout</code> every <code>deallocate</code> receives</td></tr>
+<tr><td>Thread state</td><td><code>__pony_thread_local</code> globals</td><td><code>thread_local!</code> + <code>RefCell</code>; <code>try_with</code> handles frees during thread teardown</td></tr>
+<tr><td>Flush on idle</td><td><code>suspend_flush</code>, <code>return_idle</code></td><td><code>pool::flush()</code>, called by a worker before it sleeps</td></tr>
+<tr><td>Memory back to the OS</td><td>Decommit, dirty sweeps, idle purge</td><td>None; slabs are kept, as Pony keeps arenas mapped</td></tr>
+</table>
+
+<h2 id="heap">4. The per-actor heap</h2>
+<h3>C</h3>
+<p>A Pony heap is a set of chunk lists per size class plus the GC threshold:</p>
+{{c-item original/heap.h typedef struct heap_t}}
+{{c-item original/heap.c void* ponyint_heap_alloc_small(}}
+<p>A chunk's bitmap marks free slots. Pony never frees one object at a time: the actor marks what it can reach between behaviours and sweeps the rest (<code>ponyint_heap_endgc</code>). Objects other actors hold survive because their reference counts are above zero (ORCA, section 9).</p>
+<h3>Rust: two handles</h3>
+<p>Rust frees objects one at a time, when they are dropped, and a sent object can be dropped by any actor on any thread. The heap therefore has two handles that share one <code>Arc</code>:</p>
+{{rs-item src/heap.rs pub struct Local}}
+{{rs-item src/heap.rs pub struct Remote}}
+<ul>
+<li><b><code>Local</code></b> is <code>!Send</code>. It allocates and frees with plain free lists, no atomics. Because it cannot leave its thread, neither can any <code>Box&lt;T, Local&gt;</code> or <code>Vec&lt;T, Local&gt;</code> built on it.</li>
+<li><b><code>Remote</code></b> is <code>Send + Sync</code> and can only free: it pushes the block onto the heap's atomic remote list.</li>
+</ul>
+{{rs-item src/heap.rs unsafe impl Allocator for Local}}
+{{rs-item src/heap.rs unsafe impl Allocator for Remote}}
+<p>Between batches of behaviours, where Pony would GC, the actor takes the whole remote list at once:</p>
+{{rs-item src/heap.rs pub fn collect(&self)}}
+<p>This is the "message-passing free" of <a href="https://github.com/microsoft/snmalloc">snmalloc</a>, which came out of Microsoft's Pony-inspired Verona project. It is the same shape as the pool's inbox one layer down: an owner, a lock-free list others push onto, and a single swap to drain it.</p>
+<div class="note">The heap lives as long as any handle does. If an actor stops while one of its objects is still held elsewhere, the heap stays until that object is dropped (test <code>heap_outlives_its_owner_while_objects_are_out</code>). Pony gets the same effect from reference counts.</div>
+
+<h2 id="caps">5. <code>iso</code>, <code>val</code> and <code>tag</code> as types</h2>
+<table>
+<tr><th>Pony</th><th>Rust</th><th>How it is enforced</th></tr>
+<tr><td><code>iso</code>: the only reference</td><td><code>Iso&lt;T&gt;</code> = <code>Box&lt;T, Remote&gt;</code></td><td>Sending moves it; using it after is error E0382. <code>T: Send</code> rules out pointers into the sender's heap.</td></tr>
+<tr><td><code>val</code>: immutable, shared</td><td><code>Val&lt;T&gt;</code>, an <code>Arc</code> in the actor's heap</td><td><code>Deref</code> only; <code>T: Send + Sync</code></td></tr>
+<tr><td><code>tag</code>: identity, can send</td><td><code>Addr&lt;M&gt;</code></td><td>It holds only the mailbox, so it cannot reach the state</td></tr>
+<tr><td><code>ref</code>, <code>box</code>, <code>trn</code></td><td><code>&amp;mut T</code>, <code>&amp;T</code>, (build then freeze)</td><td>Ordinary borrows inside a behaviour; not sendable in either language</td></tr>
+</table>
+<p>Making an <code>Iso</code> is Pony's <code>consume</code>: take the box apart and rebuild it with the free-only handle. Nothing is copied:</p>
+{{rs-item src/cap.rs pub fn from_box(}}
+<p><code>Arc&lt;T, A&gt;</code> with a custom allocator is still unstable in 1.100 (<code>allocator_ext</code>), so <code>Val</code> is a small hand-written <code>Arc</code> whose last drop frees through <code>Remote</code>:</p>
+{{rs-item src/cap.rs impl<T> Drop for Val<T>}}
+<p>The crate docs carry three <code>compile_fail</code> tests that <code>cargo test</code> checks:</p>
+<ul>
+<li>Sending a <code>Box&lt;u64, Local&gt;</code> to another thread: E0277, <code>Local</code> is not <code>Send</code>.</li>
+<li>Using an <code>Iso</code> after sending it: E0382, use of a moved value.</li>
+<li><code>Iso::new_in(Vec&lt;u8, Local&gt;)</code>: E0277. An <code>iso</code> may not contain memory the sender can still reach.</li>
+</ul>
+
+<h2 id="queue">6. The mailbox</h2>
+<h3>C</h3>
+<p>The queue always keeps one consumed node, the stub. A push is one exchange on <code>head</code>. Bit 0 of <code>head</code> is set when the queue is empty and the actor is not scheduled, so a sender learns "I must schedule this actor" from the same exchange:</p>
+{{c-item original/messageq.c static bool messageq_push(messageq_t* q, pony_msg_t* first, pony_msg_t* last)}}
+{{c-item original/messageq.c pony_msg_t* ponyint_actor_messageq_pop(messageq_t* q)}}
+{{c-item original/messageq.c bool ponyint_messageq_markempty(messageq_t* q)}}
+<h3>Rust</h3>
+<p>A line-by-line port. Nodes are <code>Box&lt;Node&lt;M&gt;, Pool&gt;</code> turned into raw pointers; the message is a <code>MaybeUninit&lt;M&gt;</code> so the stub holds nothing. The tag bit uses <code>map_addr</code>, which keeps the pointer's provenance.</p>
+{{rs-item src/queue.rs pub fn push(&self, msg: M)}}
+{{rs-item src/queue.rs pub unsafe fn pop(&self)}}
+{{rs-item src/queue.rs pub unsafe fn mark_empty(&self)}}
+<p><code>pop</code> and <code>mark_empty</code> are <code>unsafe</code>: only one consumer may call them. The actor cell is that consumer, so user code never does.</p>
+
+<h2 id="actors">7. Actors and the run loop</h2>
+<h3>C</h3>
+{{c-item original/actor.c bool ponyint_actor_run(pony_ctx_t* ctx, pony_actor_t* actor)}}
+<h3>Rust</h3>
+{{rs-item src/actor.rs pub trait Actor}}
+{{rs-item src/actor.rs impl<A: Actor> Runnable for ActorCell<A>}}
+{{rs-item src/actor.rs pub fn send(&self, msg: M)}}
+<p>Workers are threads with a command channel. <code>spawn</code> runs the actor's constructor on its worker, with its new heap, so the state can allocate there. Actors stay on that worker: Pony's schedulers steal actors from each other, but moving a <code>Local</code> to another thread would need an <code>unsafe impl Send</code> justified by "the state and its heap always move together". Pinning keeps the crate free of that.</p>
+{{rs-item src/actor.rs pub fn spawn<A, F>(}}
+
+<h2 id="use">8. How to use it</h2>
+<p>A producer fills buffers in its own heap and sends them as <code>Iso</code>s; the consumer sums and drops them. The shared setting is a <code>Val</code>.</p>
+{{rs-item examples/demo.rs fn receive(&mut self, cx: &Context<'_, ProducerMsg>, msg: ProducerMsg)}}
+{{output pony_actors demo}}
+<p>Things to see in the output (exact numbers vary between runs, because the threads interleave differently):</p>
+<ul>
+<li>The producer's heap stays at the same number of chunks every round. The consumer's drops come back as remote frees and are reused.</li>
+<li>The first buffer's address shows up again in later rounds: the same block went out, came back and went out again.</li>
+<li>The 4 KiB element arrays are pool blocks freed on the consumer's thread, so they return to the producer's thread in batches.</li>
+</ul>
+
+<h2 id="missing">9. What is not ported, and why</h2>
+<ul>
+<li><b>ORCA</b>, Pony's GC for objects shared between actors. Pony traces every message on send and receive and keeps per-actor reference counts, because its type system allows many references inside an actor and a GC must find them. In Rust, the owner of an <code>Iso</code> is known statically, and <code>Val</code> counts its own references, so a drop is enough.</li>
+<li><b>Tracing inside an actor.</b> <code>Drop</code> replaces it. Cycles of <code>Val</code>s leak, as with <code>Arc</code>.</li>
+<li><b>Actor GC and the cycle detector.</b> Actors live until <code>System::shutdown</code>. Dropping every <code>Addr</code> does not stop an actor.</li>
+<li><b>Work stealing</b> (section 7), <b>backpressure</b> (muting senders of an overloaded actor), and <b>the pagemap</b>, which Pony needs only to find an object's owner during tracing.</li>
+<li><b>Collections.</b> Only <code>Box</code> and <code>Vec</code> take an allocator on stable, and some <code>Vec</code> methods still don't: <code>Vec::drain</code> needs <code>allocator_ext</code> for a custom allocator. <code>String</code> and <code>HashMap</code> inside a state still use <code>Global</code>.</li>
+</ul>
+
+<h2 id="checks">10. How it is checked</h2>
+<ul>
+<li><b>14 tests</b> in <code>tests/pony.rs</code>:
+<ul>
+<li>pool reuse and alignment;</li>
+<li>32 blocks freed on another thread coming back through one inbox batch;</li>
+<li>heap accounting;</li>
+<li>an <code>Iso</code> freed on another thread and reused at the same address;</li>
+<li><code>Val</code> shared by 4 threads and dropped exactly once;</li>
+<li>mailbox empty-bit rules and per-sender order under 4 producers;</li>
+<li>an actor running more than one batch;</li>
+<li><code>Iso</code>s passing through three actors at the same address.</li>
+</ul></li>
+<li><b>3 <code>compile_fail</code> doc tests</b> for the capability rules (section 5).</li>
+<li><b>Miri</b> runs the tests under 4 thread schedules (<code>-Zmiri-many-seeds=0..4</code>) and under Tree Borrows, and finds no undefined behaviour. Its only warnings are the expected integer-to-pointer casts from the slab lookup.</li>
+</ul>
+
+<h2 id="run">11. Running it</h2>
+<figure class="code out"><figcaption><span><span class="lang">Shell</span> from the repository root</span></figcaption><pre><code>cargo test -p pony_actors
+cargo run -p pony_actors --example demo
+MIRIFLAGS=-Zmiri-many-seeds=0..4 cargo +nightly miri test -p pony_actors --test pony</code></pre></figure>
+
+<h2 id="files">12. Full source</h2>
+{{rs-file src/pool.rs}}
+{{rs-file src/heap.rs}}
+{{rs-file src/cap.rs}}
+{{rs-file src/queue.rs}}
+{{rs-file src/actor.rs}}
+{{c-file original/pool_arena.c}}
+{{c-file original/heap.c}}
+{{c-file original/messageq.c}}
